@@ -1,7 +1,17 @@
 """
 Pipeline Orchestrator — 獨立後端
-啟動：uvicorn main:app --host 0.0.0.0 --port 8000
+啟動：uvicorn main:app --host 0.0.0.0 --port 8002
 """
+# Windows console 預設 cp1252/cp950 無法印 emoji / 中文 → 啟動時強制 UTF-8
+# 不靠 PYTHONIOENCODING env var，避免使用者沒設或 .bat 傳遞失效
+import sys as _sys
+try:
+    if hasattr(_sys.stdout, "reconfigure"):
+        _sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        _sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 import asyncio
 import json
 import os
@@ -19,7 +29,8 @@ app = FastAPI(title="Pipeline Orchestrator", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3002", "http://127.0.0.1:3002",
+    allow_origins=["http://localhost:3003", "http://127.0.0.1:3003",
+                   "http://localhost:3002", "http://127.0.0.1:3002",
                    "http://localhost:3000", "http://127.0.0.1:3000"],
     allow_credentials=True,
     allow_methods=["*"],
