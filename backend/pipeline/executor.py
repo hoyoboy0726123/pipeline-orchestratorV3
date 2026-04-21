@@ -712,6 +712,7 @@ def _try_sandbox_exec(tool_name: str, tool_input: str, cwd: Optional[str], run_i
     if _SANDBOX_WARNED:
         _SANDBOX_WARNED.clear()
 
+    log.info(f"[sandbox] 🛡 在容器內執行 {tool_name}（{len(tool_input)} 字元）")
     if tool_name == "run_python":
         res = _sandbox.run_python(
             tool_input, cwd=cwd,
@@ -728,6 +729,8 @@ def _try_sandbox_exec(tool_name: str, tool_input: str, cwd: Optional[str], run_i
             register_cb=register_proc,
             unregister_cb=unregister_proc,
         )
+    log.info(f"[sandbox] ✓ 容器執行完畢 rc={res.returncode}"
+             + (" (timed out)" if res.timed_out else ""))
 
     # 組裝輸出 — 格式刻意與 host 版本一致，LLM 分不出差別
     output = ""
