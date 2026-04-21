@@ -93,18 +93,26 @@ def _run_wsl(args: list[str], timeout: float = 10.0) -> tuple[int, str, str]:
 
 def _detect_docker_prefix() -> list[str]:
     """決定呼叫 docker 時要不要加 sudo。
-    優先試 plain `docker ps`；失敗試 `sudo docker ps`。結果快取。"""
+    優先試 plain `docker ps`；失敗試 `sudo docker ps`。結果快取。
+    用 `docker ps` 不用 `docker info`：前者極快（ms 級），後者會列 daemon 資訊（數百行、慢），
+    cold-start 的 WSL 常超過 5s 讓偵測誤判為失敗。"""
     with _DOCKER_PREFIX_LOCK:
         if _DOCKER_PREFIX_CACHE["prefix"] is not None:
             return _DOCKER_PREFIX_CACHE["prefix"]
 
         # 試 plain docker（前提：使用者已加入 docker group 且 WSL 重啟過）
-        rc, _, _ = _run_wsl(["-e", "docker", "info"], timeout=5.0)
+        # timeout 拉到 15s 容納 WSL cold start（首次 wsl.exe 呼叫可能要 5-10s 起 VM）
+        rc, _, _ = _run_wsl(["-e", "docker", "ps", "-q"], timeout=15.0)
         if rc == 0:
             _DOCKER_PREFIX_CACHE["prefix"] = ["docker"]
         else:
-            # fallback 到 sudo（需使用者在 sudoers NOPASSWD 或系統不會互動詢問）
-            _DOCKER_PREFIX_CACHE["prefix"] = ["sudo", "docker"]
+            # 試 sudo（使用者需 NOPASSWD 或 cached sudo ticket）
+            rc2, _, _ = _run_wsl(["-n", "-e", "sudo", "-n", "docker", "ps", "-q"], timeout=10.0)
+            if rc2 == 0:
+                _DOCKER_PREFIX_CACHE["prefix"] = ["sudo", "docker"]
+            else:
+                # 兩種都不行 — 還是記 ["docker"]，check_status 會判失敗讓 UI 顯示 hint
+                _DOCKER_PREFIX_CACHE["prefix"] = ["docker"]
         return _DOCKER_PREFIX_CACHE["prefix"]
 
 
@@ -151,7 +159,8 @@ def check_status(force_refresh: bool = False) -> dict:
     # 2. Docker daemon 可用嗎
     if wsl_ok:
         docker_prefix = _detect_docker_prefix()
-        rc, out, _ = _run_wsl(["-e", *docker_prefix, "--version"], timeout=5.0)
+        # timeout 拉到 10s：cold-start WSL 首次 wsl.exe 啟 VM 要 5-10s
+        rc, out, _ = _run_wsl(["-e", *docker_prefix, "--version"], timeout=10.0)
         if rc == 0 and out.strip():
             docker_ok = True
             docker_version = out.strip().split("\n", 1)[0][:100]
@@ -166,7 +175,7 @@ def check_status(force_refresh: bool = False) -> dict:
             ["-e", *docker_prefix, "ps", "-a",
              "--filter", f"name=^{CONTAINER_NAME}$",
              "--format", "{{.Status}}"],
-            timeout=5.0,
+            timeout=10.0,
         )
         status_line = out.strip()
         if rc == 0 and status_line:
