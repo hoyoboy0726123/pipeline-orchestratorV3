@@ -1,0 +1,22 @@
+# Skill 沙盒容器預裝套件（對齊 backend/skill_packages.txt 中的可跨平台部分）
+# 不包含：pywin32 (Windows only)、pyautogui/mss/pynput/pygetwindow (需 GUI display)
+pandas
+openpyxl
+matplotlib
+requests
+beautifulsoup4
+Pillow
+python-docx
+cloudscraper
+fake-useragent
+httpx[http2]
+newspaper3k
+yfinance
+selenium
+defusedxml
+lxml
+markitdown[pptx]
+opencv-python-headless
+numpy
+python-dateutil
+pytz
