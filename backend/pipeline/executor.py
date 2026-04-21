@@ -658,7 +658,13 @@ def _parse_skill_tool_calls(text: str) -> list[dict]:
 
 
 def _execute_skill_tool(tool_name: str, tool_input: str, cwd: Optional[str] = None, run_id: str = "") -> str:
-    """執行單一工具。"""
+    """執行單一工具。
+    若 settings.skill_sandbox_mode='wsl_docker' 且沙盒可用，run_python / run_shell
+    會走沙盒容器；其餘情況走原本 host subprocess。"""
+    if tool_name in ("run_python", "run_shell"):
+        sandbox_out = _try_sandbox_exec(tool_name, tool_input, cwd, run_id)
+        if sandbox_out is not None:
+            return sandbox_out
     if tool_name == "run_python":
         return _skill_run_python(tool_input, cwd=cwd, run_id=run_id)
     elif tool_name == "run_shell":
@@ -669,6 +675,78 @@ def _execute_skill_tool(tool_name: str, tool_input: str, cwd: Optional[str] = No
         return "__DONE__"
     else:
         return f"[錯誤] 未知工具：{tool_name}"
+
+
+# ── 沙盒路由（V3） ────────────────────────────────────────────────
+# 避免每次呼叫都 log「沙盒不可用」洗頻，用 set 去重（reason 作為 key）
+_SANDBOX_WARNED: set[str] = set()
+
+
+def _try_sandbox_exec(tool_name: str, tool_input: str, cwd: Optional[str], run_id: str) -> Optional[str]:
+    """若 settings.skill_sandbox_mode='wsl_docker' 且沙盒可用，就把 run_python/run_shell
+    送進 pipeline-sandbox 容器執行。回傳組好的 output 字串（格式對齊 host 版本）；
+    若 mode=host 或沙盒不可用則回傳 None 讓 caller fallback 到 host subprocess。"""
+    try:
+        import sys as _sys
+        _backend_dir = str(Path(__file__).resolve().parent.parent)
+        if _backend_dir not in _sys.path:
+            _sys.path.insert(0, _backend_dir)
+        from settings import get_settings
+        from pipeline import sandbox as _sandbox
+    except Exception as e:
+        log.warning(f"[sandbox] import 失敗（fallback 到 host）：{e}")
+        return None
+
+    mode = (get_settings().get("skill_sandbox_mode") or "host").strip()
+    if mode != "wsl_docker":
+        return None
+
+    ok, reason = _sandbox.ensure_running()
+    if not ok:
+        key = reason or "unknown"
+        if key not in _SANDBOX_WARNED:
+            log.warning(f"[sandbox] 沙盒不可用，此次 fallback 到 host：{reason}")
+            _SANDBOX_WARNED.add(key)
+        return None
+    # 沙盒恢復健康後，清掉之前的告警記錄下次若又壞可再提醒
+    if _SANDBOX_WARNED:
+        _SANDBOX_WARNED.clear()
+
+    if tool_name == "run_python":
+        res = _sandbox.run_python(
+            tool_input, cwd=cwd,
+            timeout=SKILL_TOOL_TIMEOUT,
+            run_id=run_id,
+            register_cb=register_proc,
+            unregister_cb=unregister_proc,
+        )
+    else:  # run_shell
+        res = _sandbox.run_shell(
+            tool_input, cwd=cwd,
+            timeout=SKILL_TOOL_TIMEOUT,
+            run_id=run_id,
+            register_cb=register_proc,
+            unregister_cb=unregister_proc,
+        )
+
+    # 組裝輸出 — 格式刻意與 host 版本一致，LLM 分不出差別
+    output = ""
+    if res.stdout:
+        output += res.stdout
+    if res.stderr:
+        tag = "stderr" if res.returncode != 0 else "warnings"
+        output += f"\n[{tag}]\n{res.stderr}"
+    if res.returncode != 0:
+        output += f"\n[exit code: {res.returncode}]"
+        if not res.stdout and not res.stderr:
+            output += (
+                "\n[提示] 子程序非正常結束但沒捕捉到任何 stdout / stderr。"
+                "請把整段程式用 try/except 包起來，except 裡 "
+                "`import traceback; traceback.print_exc()` 再 `sys.exit(0)`。"
+            )
+    elif not res.stdout and tool_name == "run_python":
+        output += "\n[執行成功，程式無 stdout 輸出]"
+    return output.strip() or "(無輸出)"
 
 
 async def _wait_for_ask_user(

@@ -22,6 +22,10 @@ _DEFAULT = {
     "telegram_bot_token": "",
     "telegram_chat_id": "",
     "line_notify_token": "",       # LINE Notify（預留）
+    # Skill 沙盒（V3）：run_python / run_shell 執行位置
+    #   "host"       — Windows 原生 subprocess（快、跟 V2 一樣）
+    #   "wsl_docker" — 透過 WSL 內的 pipeline-sandbox 容器執行（隔離、需先跑 sandbox/setup_sandbox.bat）
+    "skill_sandbox_mode": "host",
 }
 
 _cache: Optional[dict] = None
@@ -100,3 +104,20 @@ def settings_signature() -> str:
     """回傳一個代表當前設定的簡易字串，用於 LLM 快取失效判斷。"""
     s = get_settings()
     return f"{s['provider']}::{s['model']}::{s['ollama_base_url']}::{s.get('ollama_thinking', 'off')}::{s.get('ollama_num_ctx', 16384)}"
+
+
+# ── Sandbox mode（獨立 setter，不混進 model 更新流程） ─────────────
+def set_skill_sandbox_mode(mode: str) -> dict:
+    """切換 skill 執行模式。mode ∈ {"host", "wsl_docker"}。"""
+    global _cache
+    mode = (mode or "host").strip()
+    if mode not in ("host", "wsl_docker"):
+        raise ValueError(f"invalid skill_sandbox_mode: {mode}")
+    with _lock:
+        existing = _cache if _cache else _load_from_disk()
+        existing["skill_sandbox_mode"] = mode
+        _SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(existing, f, ensure_ascii=False, indent=2)
+        _cache = existing
+    return dict(existing)
