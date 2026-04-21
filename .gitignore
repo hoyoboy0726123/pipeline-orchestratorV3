@@ -30,6 +30,9 @@ backend/ai_output/
 backend/pipelines/
 pipelines/
 
+# Sandbox LLM 暫存程式碼（V3）
+sandbox/_tmp/
+
 # Claude Code local settings
 .claude/
 
