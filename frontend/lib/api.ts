@@ -10,7 +10,7 @@ const BASE = '/api/backend'
 const DIRECT_BASE = (() => {
   if (typeof window === 'undefined') return BASE
   const { hostname } = window.location
-  if (hostname === 'localhost' || hostname === '127.0.0.1') return 'http://localhost:8001'
+  if (hostname === 'localhost' || hostname === '127.0.0.1') return 'http://localhost:8002'
   return BASE
 })()
 
