@@ -1,5 +1,13 @@
 """
 Skill 套件管理器 — 管理 AI技能節點可用的 Python 第三方套件
+
+V3 支援雙環境：
+- host       ：backend 所在 Windows venv（對應 skill_packages.txt）
+- sandbox    ：WSL Docker 容器 pipeline-sandbox（對應 sandbox/requirements.txt）
+
+UI 一次只操作一邊，跟著 skill_sandbox_mode toggle 走。target 參數決定目標：
+  "auto" → 讀 settings.skill_sandbox_mode 決定（預設）
+  "host" / "sandbox" → 明確指定
 """
 import subprocess
 import sys
@@ -9,6 +17,22 @@ from pathlib import Path
 from threading import Lock
 
 _PKG_FILE = Path(__file__).parent / "skill_packages.txt"
+# 沙盒的套件清單（對應容器內環境）— 跟 Dockerfile 一起被 sandbox/setup.sh 讀取
+_SANDBOX_REQ_FILE = Path(__file__).parent.parent / "sandbox" / "requirements.txt"
+_SANDBOX_CONTAINER = "pipeline-sandbox"
+
+
+def _resolve_target(target: str) -> str:
+    """把 'auto' 解析成實際的 'host' 或 'sandbox'（讀 settings）。"""
+    t = (target or "auto").strip().lower()
+    if t in ("host", "sandbox"):
+        return t
+    try:
+        from settings import get_settings
+        mode = (get_settings().get("skill_sandbox_mode") or "host").strip()
+        return "sandbox" if mode == "wsl_docker" else "host"
+    except Exception:
+        return "host"
 
 # ── pip list 快取（一次抓全部，避免對每個套件各呼叫 pip show）──
 _PIP_CACHE: dict = {"ts": 0.0, "data": {}}  # {"pandas": {"version": "2.0", "installed": True}, ...}
@@ -246,6 +270,194 @@ def scan_unlisted_packages() -> list[dict]:
         unlisted.append({"name": name, "version": pkg.get("version", "")})
     unlisted.sort(key=lambda x: x["name"].lower())
     return unlisted
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sandbox 版本（走 wsl docker exec）
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SANDBOX_PIP_CACHE: dict = {"ts": 0.0, "data": {}}
+
+
+def _sandbox_docker_prefix() -> list[str]:
+    """借用 sandbox 模組已偵測好的 docker 前綴（免重複偵測）。"""
+    try:
+        from pipeline import sandbox as _s
+        return _s._detect_docker_prefix()  # noqa: SLF001
+    except Exception:
+        return ["docker"]
+
+
+def _sandbox_pip_snapshot(force_refresh: bool = False) -> dict[str, dict]:
+    with _PIP_CACHE_LOCK:
+        if not force_refresh and (time.time() - _SANDBOX_PIP_CACHE["ts"]) < _PIP_CACHE_TTL and _SANDBOX_PIP_CACHE["data"]:
+            return _SANDBOX_PIP_CACHE["data"]
+        snapshot: dict[str, dict] = {}
+        prefix = _sandbox_docker_prefix()
+        try:
+            r = subprocess.run(
+                ["wsl", "-e", *prefix, "exec", _SANDBOX_CONTAINER, "pip", "list", "--format=json"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
+            )
+            if r.returncode == 0:
+                for item in _json.loads(r.stdout or "[]"):
+                    name = str(item.get("name") or "").lower()
+                    if name:
+                        snapshot[name] = {"version": str(item.get("version") or "")}
+        except Exception:
+            pass
+        _SANDBOX_PIP_CACHE["ts"] = time.time()
+        _SANDBOX_PIP_CACHE["data"] = snapshot
+        return snapshot
+
+
+def _invalidate_sandbox_pip_cache() -> None:
+    with _PIP_CACHE_LOCK:
+        _SANDBOX_PIP_CACHE["ts"] = 0.0
+        _SANDBOX_PIP_CACHE["data"] = {}
+
+
+def _sandbox_pip_install(pkg_name: str) -> tuple[bool, str]:
+    prefix = _sandbox_docker_prefix()
+    try:
+        result = subprocess.run(
+            ["wsl", "-e", *prefix, "exec", _SANDBOX_CONTAINER, "pip", "install", "--no-cache-dir", pkg_name],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180,
+        )
+        if result.returncode == 0:
+            return True, f"✅ {pkg_name} 已安裝到沙盒容器"
+        return False, f"❌ {pkg_name} 沙盒安裝失敗：{(result.stderr or result.stdout or '').strip()[:500]}"
+    except subprocess.TimeoutExpired:
+        return False, f"❌ {pkg_name} 沙盒安裝逾時（>180 秒）"
+    except Exception as e:
+        return False, f"❌ {pkg_name} 沙盒安裝錯誤：{e}"
+
+
+def _sandbox_pip_uninstall(pkg_name: str) -> tuple[bool, str]:
+    base = _base_name(pkg_name)
+    prefix = _sandbox_docker_prefix()
+    try:
+        result = subprocess.run(
+            ["wsl", "-e", *prefix, "exec", _SANDBOX_CONTAINER, "pip", "uninstall", base, "-y"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
+        )
+        if result.returncode == 0:
+            return True, f"✅ {base} 已從沙盒移除"
+        return False, f"❌ {base} 沙盒移除失敗：{(result.stderr or '').strip()[:300]}"
+    except Exception as e:
+        return False, f"❌ {base} 沙盒移除錯誤：{e}"
+
+
+def _read_sandbox_packages() -> list[str]:
+    if not _SANDBOX_REQ_FILE.exists():
+        return []
+    lines = _SANDBOX_REQ_FILE.read_text(encoding="utf-8").splitlines()
+    return [l.strip() for l in lines if l.strip() and not l.strip().startswith("#")]
+
+
+def _write_sandbox_packages(packages: list[str]) -> None:
+    """保留原始標頭註解（tier 分組、提示），只更新套件部分。"""
+    header = (
+        "# Skill 沙盒容器預裝套件\n"
+        "# 分成幾個 tier：build 時 Dockerfile 會拆成多個 RUN 讓每層獨立裝，避免一次性 OOM\n"
+        "#\n"
+        "# 沒進這清單但某個 workflow 需要的套件，可以事後臨時裝進容器：\n"
+        "#   wsl sudo docker exec pipeline-sandbox pip install <pkg>\n"
+        "# 要永久加，把它寫進這檔然後 rebuild image。\n\n"
+    )
+    _SANDBOX_REQ_FILE.write_text(header + "\n".join(packages) + "\n", encoding="utf-8")
+
+
+def list_packages_sandbox() -> list[dict]:
+    """列出沙盒容器已安裝套件 + 標記哪些在 requirements.txt 裡。"""
+    declared = _read_sandbox_packages()
+    declared_bases = {_base_name(p) for p in declared}
+    snapshot = _sandbox_pip_snapshot()
+    # 包含「在清單但還沒裝」(rare) + 「已裝且在清單」 + 「臨時裝但不在清單」
+    result = []
+    seen: set[str] = set()
+    for pkg in declared:
+        base = _base_name(pkg)
+        info = snapshot.get(base)
+        result.append({
+            "name": pkg,
+            "installed": info is not None,
+            "version": info.get("version", "") if info else "",
+            "managed": True,  # 在 requirements.txt 裡
+        })
+        seen.add(base)
+    # 容器中還有的（臨時裝的），也列出來但標為 managed=False
+    for base, info in snapshot.items():
+        if base in seen:
+            continue
+        # 略過 pip/setuptools/wheel 這類 bootstrap
+        if base in _BOOTSTRAP_EXCLUDES:
+            continue
+        result.append({
+            "name": base,
+            "installed": True,
+            "version": info.get("version", ""),
+            "managed": False,
+        })
+    return result
+
+
+def add_package_sandbox(pkg_name: str) -> tuple[bool, str]:
+    """沙盒安裝套件 + 寫進 sandbox/requirements.txt（rebuild 後也保留）。"""
+    pkg_name = pkg_name.strip()
+    if not pkg_name:
+        return False, "套件名稱不能為空"
+    declared = _read_sandbox_packages()
+    base = _base_name(pkg_name)
+    for p in declared:
+        if _base_name(p) == base:
+            return False, f"{pkg_name} 已在沙盒清單中"
+    ok, msg = _sandbox_pip_install(pkg_name)
+    if not ok:
+        return False, msg
+    declared.append(pkg_name)
+    _write_sandbox_packages(declared)
+    _invalidate_sandbox_pip_cache()
+    return True, msg
+
+
+def remove_package_sandbox(pkg_name: str) -> tuple[bool, str]:
+    """沙盒移除套件 + 從 sandbox/requirements.txt 拿掉。"""
+    pkg_name = pkg_name.strip()
+    declared = _read_sandbox_packages()
+    base = _base_name(pkg_name)
+    new_declared = [p for p in declared if _base_name(p) != base]
+    found_in_list = len(new_declared) != len(declared)
+    ok, msg = _sandbox_pip_uninstall(pkg_name)
+    if found_in_list:
+        _write_sandbox_packages(new_declared)
+    _invalidate_sandbox_pip_cache()
+    if not ok and not found_in_list:
+        return False, f"{pkg_name} 不在沙盒清單中"
+    return ok or found_in_list, msg if ok else f"✅ {base} 已從沙盒清單移除（容器內未安裝或移除失敗）"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 統一入口（依 target 分流）
+# ─────────────────────────────────────────────────────────────────────────────
+
+def list_packages_by_target(target: str = "auto") -> dict:
+    t = _resolve_target(target)
+    if t == "sandbox":
+        return {"target": "sandbox", "packages": list_packages_sandbox()}
+    return {"target": "host", "packages": list_packages()}
+
+
+def add_package_by_target(pkg_name: str, target: str = "auto") -> tuple[bool, str, str]:
+    t = _resolve_target(target)
+    ok, msg = add_package_sandbox(pkg_name) if t == "sandbox" else add_package(pkg_name)
+    return ok, msg, t
+
+
+def remove_package_by_target(pkg_name: str, target: str = "auto") -> tuple[bool, str, str]:
+    t = _resolve_target(target)
+    ok, msg = remove_package_sandbox(pkg_name) if t == "sandbox" else remove_package(pkg_name)
+    return ok, msg, t
 
 
 def add_to_list_only(pkg_name: str) -> tuple[bool, str]:

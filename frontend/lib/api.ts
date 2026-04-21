@@ -514,31 +514,40 @@ export async function getNodeStatus(): Promise<NodeStatus> {
   return res.json()
 }
 
-export async function getSkillPackages(): Promise<SkillPackage[]> {
-  const res = await fetchWithRetry(`${BASE}/settings/skill-packages`)
-  if (!res.ok) throw new Error('讀取套件清單失敗')
-  const data = await res.json()
-  return data.packages
+// V3：target = 'auto' 會跟著當前 sandbox toggle，'host' / 'sandbox' 可明確指定
+export type SkillPackageTarget = 'auto' | 'host' | 'sandbox'
+
+export interface SkillPackagesResponse {
+  target: 'host' | 'sandbox'   // 後端 resolve 後實際是哪一邊
+  packages: SkillPackage[]
 }
 
-export async function addSkillPackage(name: string): Promise<string> {
+export async function getSkillPackages(target: SkillPackageTarget = 'auto'): Promise<SkillPackagesResponse> {
+  const qs = target === 'auto' ? '' : `?target=${target}`
+  const res = await fetchWithRetry(`${BASE}/settings/skill-packages${qs}`)
+  if (!res.ok) throw new Error('讀取套件清單失敗')
+  return res.json()
+}
+
+export async function addSkillPackage(name: string, target: SkillPackageTarget = 'auto'): Promise<{ message: string; target: string }> {
   const res = await fetch(`${BASE}/settings/skill-packages`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name }),
+    body: JSON.stringify({ name, target }),
   })
   const data = await res.json()
   if (!res.ok) throw new Error(data.detail ?? '安裝失敗')
-  return data.message
+  return data
 }
 
-export async function removeSkillPackage(name: string): Promise<string> {
-  const res = await fetch(`${BASE}/settings/skill-packages/${encodeURIComponent(name)}`, {
+export async function removeSkillPackage(name: string, target: SkillPackageTarget = 'auto'): Promise<{ message: string; target: string }> {
+  const qs = target === 'auto' ? '' : `?target=${target}`
+  const res = await fetch(`${BASE}/settings/skill-packages/${encodeURIComponent(name)}${qs}`, {
     method: 'DELETE',
   })
   const data = await res.json()
   if (!res.ok) throw new Error(data.detail ?? '移除失敗')
-  return data.message
+  return data
 }
 
 export interface UnlistedPackage { name: string; version: string }

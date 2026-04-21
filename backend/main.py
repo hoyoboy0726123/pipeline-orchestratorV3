@@ -314,31 +314,35 @@ async def get_node_status():
 
 # ── Skill Packages ──────────────────────────────────────────
 @app.get("/settings/skill-packages")
-async def get_skill_packages():
-    from skill_pkg_manager import list_packages
-    return {"packages": list_packages()}
+async def get_skill_packages(target: str = "auto"):
+    """列出 skill 套件。
+    target: "auto"（跟著 skill_sandbox_mode 走）/ "host" / "sandbox"
+    回傳含 `target` 欄位讓前端知道實際對象。"""
+    from skill_pkg_manager import list_packages_by_target
+    return list_packages_by_target(target)
 
 
 class SkillPackageRequest(BaseModel):
     name: str
+    target: str = "auto"
 
 
 @app.post("/settings/skill-packages")
 async def add_skill_package(req: SkillPackageRequest):
-    from skill_pkg_manager import add_package
-    ok, msg = add_package(req.name)
+    from skill_pkg_manager import add_package_by_target
+    ok, msg, resolved = add_package_by_target(req.name, req.target)
     if not ok:
         raise HTTPException(status_code=400, detail=msg)
-    return {"message": msg}
+    return {"message": msg, "target": resolved}
 
 
 @app.delete("/settings/skill-packages/{pkg_name}")
-async def remove_skill_package(pkg_name: str):
-    from skill_pkg_manager import remove_package
-    ok, msg = remove_package(pkg_name)
+async def remove_skill_package(pkg_name: str, target: str = "auto"):
+    from skill_pkg_manager import remove_package_by_target
+    ok, msg, resolved = remove_package_by_target(pkg_name, target)
     if not ok:
         raise HTTPException(status_code=400, detail=msg)
-    return {"message": msg}
+    return {"message": msg, "target": resolved}
 
 
 @app.get("/settings/skill-packages/unlisted")

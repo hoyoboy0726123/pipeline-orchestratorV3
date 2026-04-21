@@ -259,11 +259,16 @@ function SkillPackagesSection() {
   const [unlisted, setUnlisted] = useState<UnlistedPackage[]>([])
   const [adopting, setAdopting] = useState<string | null>(null)
 
+  // V3：套件管理跟著當前 skill_sandbox_mode 走（host / sandbox）
+  // 這個 target 是後端 resolve 後告訴我們實際操作的是哪邊，供 UI 顯示
+  const [currentTarget, setCurrentTarget] = useState<'host' | 'sandbox'>('host')
+
   const loadPkgs = async () => {
     setLoading(true)
     try {
-      const pkgs = await getSkillPackages()
-      setPackages(pkgs)
+      const resp = await getSkillPackages('auto')
+      setPackages(resp.packages)
+      setCurrentTarget(resp.target)
     } catch (e) {
       toast.error((e as Error).message)
     } finally {
@@ -273,13 +278,20 @@ function SkillPackagesSection() {
 
   useEffect(() => { loadPkgs() }, [])
 
+  // 監聽沙盒 toggle 改變事件，自動 reload（由 SandboxSection 觸發）
+  useEffect(() => {
+    const handler = () => { loadPkgs() }
+    window.addEventListener('sandbox-mode-changed', handler)
+    return () => window.removeEventListener('sandbox-mode-changed', handler)
+  }, [])
+
   const handleAdd = async () => {
     const name = newPkg.trim()
     if (!name) return
     setInstalling(true)
     try {
-      const msg = await addSkillPackage(name)
-      toast.success(msg)
+      const { message } = await addSkillPackage(name, 'auto')
+      toast.success(message)
       setNewPkg('')
       await loadPkgs()
     } catch (e) {
@@ -292,8 +304,8 @@ function SkillPackagesSection() {
   const handleRemove = async (name: string) => {
     setRemovingPkg(name)
     try {
-      const msg = await removeSkillPackage(name)
-      toast.success(msg)
+      const { message } = await removeSkillPackage(name, 'auto')
+      toast.success(message)
       await loadPkgs()
     } catch (e) {
       toast.error((e as Error).message)
@@ -320,8 +332,8 @@ function SkillPackagesSection() {
   const handleInstallSuggestion = async (pipName: string) => {
     setInstalling(true)
     try {
-      const msg = await addSkillPackage(pipName)
-      toast.success(msg)
+      const { message } = await addSkillPackage(pipName, 'auto')
+      toast.success(message)
       setSuggestions(prev => prev.filter(s => s.pip_name !== pipName))
       await loadPkgs()
     } catch (e) {
@@ -378,9 +390,23 @@ function SkillPackagesSection() {
         <div className="w-10 h-10 rounded-xl bg-purple-100 flex items-center justify-center">
           <Package className="w-5 h-5 text-purple-700" />
         </div>
-        <div>
-          <h2 className="text-lg font-semibold text-gray-900">AI技能套件</h2>
-          <p className="text-sm text-gray-500">管理 AI技能節點可使用的 Python 第三方套件</p>
+        <div className="flex-1 min-w-0">
+          <h2 className="text-lg font-semibold text-gray-900 flex items-center gap-2">
+            AI技能套件
+            <span className={cn(
+              'text-xs px-2 py-0.5 rounded-full font-medium',
+              currentTarget === 'sandbox'
+                ? 'bg-indigo-50 text-indigo-700 border border-indigo-200'
+                : 'bg-gray-100 text-gray-600 border border-gray-200'
+            )}>
+              {currentTarget === 'sandbox' ? '🛡 沙盒容器' : '💻 本機 venv'}
+            </span>
+          </h2>
+          <p className="text-sm text-gray-500">
+            {currentTarget === 'sandbox'
+              ? '目前管理：pipeline-sandbox 容器（切換到本機模式會改管 Host venv）'
+              : '目前管理：Host Python venv（切換到沙盒模式會改管容器）'}
+          </p>
         </div>
       </div>
 
@@ -727,6 +753,8 @@ function SandboxSection() {
       const updated = await setSandboxMode(next)
       setStatus(updated)
       toast.success(`已切換到${next === 'wsl_docker' ? '沙盒模式' : '本機模式'}`)
+      // 通知 SkillPackagesSection 重新載入清單（以免使用者看到的是舊環境套件）
+      window.dispatchEvent(new Event('sandbox-mode-changed'))
     } catch (e) {
       toast.error((e as Error).message)
     } finally {
@@ -1304,8 +1332,8 @@ export default function SettingsPage() {
         {/* Installed Skills (Claude Code skills from ~/.agents/skills/) */}
         <InstalledSkillsSection onInstallRequest={async (pkg) => {
           try {
-            const msg = await addSkillPackage(pkg)
-            toast.success(msg)
+            const { message } = await addSkillPackage(pkg, 'auto')
+            toast.success(message)
           } catch (e) {
             toast.error((e as Error).message)
           }
