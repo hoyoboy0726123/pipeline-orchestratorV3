@@ -4,7 +4,8 @@
 # 原則：只裝「純運算 / I/O」類套件。桌面自動化（pyautogui / mss / pynput）走不了
 # 容器（沒有 display），保留在 host 上跑。
 #
-# 映像大小目標：<1GB。套件清單對齊 backend/skill_packages.txt 的可用部分。
+# 分層策略：故意把 pip install 拆成多個 RUN，每層獨立釋放記憶體，避免在
+# WSL2 預設 8GB 下一次壓縮 20 個套件導致 buildkit OOM（SIGBUS）。
 FROM python:3.13-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -14,7 +15,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1
 
-# Debian 語系包：讓 subprocess 的 locale 能正確處理中文檔名/內容
+# ── System：locale + ca-certificates + curl ──
 RUN apt-get update && apt-get install -y --no-install-recommends \
         locales ca-certificates curl \
     && sed -i '/zh_TW.UTF-8/s/^# //g; /en_US.UTF-8/s/^# //g' /etc/locale.gen \
@@ -22,13 +23,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 ENV LANG=zh_TW.UTF-8 LC_ALL=zh_TW.UTF-8
 
-# 預裝 skill_packages.txt 中可跨平台的套件（排除 pywin32 + 桌面自動化）
-# 如果要加新套件，改 requirements.txt 後重 build image 即可
-COPY requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt \
-    && rm /tmp/requirements.txt
+# ── Tier 1：核心數值/文件處理（小而快）──
+RUN pip install --no-cache-dir \
+    pandas openpyxl numpy python-dateutil pytz defusedxml Pillow python-docx
 
-# 長駐容器用的掛載目錄。backend 會把 project root bind mount 進來。
+# ── Tier 2：HTTP/解析（中量）──
+RUN pip install --no-cache-dir \
+    requests beautifulsoup4 lxml "httpx[http2]"
+
+# ── Tier 3：繪圖/影像處理（重，單獨一層避免與 Tier 1/2 同時壓縮）──
+RUN pip install --no-cache-dir \
+    matplotlib opencv-python-headless
+
 WORKDIR /project
 
 # tail -f /dev/null：讓容器保持 running 等 exec 指令

@@ -86,7 +86,33 @@ sudo docker rm -f pipeline-sandbox
 - 路徑翻譯：LLM 程式碼若用 Windows 絕對路徑 `C:\Users\...`，backend 會自動轉成 Linux `/mnt/c/Users/...`（映射同一份檔案）
 - Agent Skills：`~/.agents/skills/<skill_name>/` 在容器內也能用 `Path.home() / ".agents" / "skills" / ...` 讀到（`/root/.agents` 指向 host 的 `.agents`）
 
+## 調整 WSL 記憶體（重要：避免 build 時 OOM）
+
+WSL2 預設記憶體上限是主機 RAM 的 50%（最多 8GB），但 Docker build 一次壓縮多個大型套件（numpy / opencv / matplotlib）時容易撞到。
+
+建立 `C:\Users\<你>\.wslconfig`：
+
+```ini
+[wsl2]
+memory=8GB
+swap=16GB
+processors=auto
+```
+
+然後 PowerShell 執行 `wsl --shutdown`，下次 WSL 啟動就吃新設定。
+
 ## 疑難排解
+
+**Build 卡在 `pip install` 然後 Docker daemon crash（SIGBUS / bus error）**
+→ WSL 記憶體不夠。先套上面的 `.wslconfig`、`wsl --shutdown`、清空舊快取：
+```
+wsl sudo docker builder prune -af
+wsl sudo docker rm -f pipeline-sandbox
+```
+然後再跑一次 `setup_sandbox.bat`。
+
+Dockerfile 本來就把 pip install 拆成多個 RUN 分層安裝，每層獨立 OOM-safe。若仍然爆記憶體，把 Tier 3（matplotlib / opencv）那段 RUN 改分成兩行。
+
 
 **`setup_sandbox.bat` 卡在 sudo 密碼**
 → WSL Ubuntu 的密碼。忘了的話在 WSL 內 `sudo passwd $USER` 重設（需輸入目前密碼）。完全忘了可用 admin PowerShell `wsl --user root passwd <your_username>`。
