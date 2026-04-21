@@ -701,6 +701,36 @@ export async function saveNotificationSettings(s: Partial<NotificationSettings>)
   return res.json()
 }
 
+// ── Skill Sandbox (V3) ────────────────────────────────────
+export interface SandboxStatus {
+  mode: 'host' | 'wsl_docker'
+  wsl_ok: boolean
+  docker_ok: boolean
+  docker_version: string
+  container_exists: boolean
+  container_running: boolean
+  ready: boolean
+  reasons: string[]
+  hint: string
+}
+
+export async function getSandboxStatus(refresh = false): Promise<SandboxStatus> {
+  const qs = refresh ? '?refresh=true' : ''
+  const res = await fetchWithRetry(`${BASE}/settings/sandbox${qs}`)
+  if (!res.ok) throw new Error('讀取沙盒狀態失敗')
+  return res.json()
+}
+
+export async function setSandboxMode(mode: 'host' | 'wsl_docker'): Promise<SandboxStatus> {
+  const res = await fetch(`${BASE}/settings/sandbox`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mode }),
+  })
+  if (!res.ok) throw new Error('切換沙盒模式失敗')
+  return res.json()
+}
+
 export async function pipelineChat(messages: Array<{ role: 'user' | 'assistant'; content: string }>): Promise<{
   reply: string
   has_yaml: boolean

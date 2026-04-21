@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useState } from 'react'
-import { Settings as SettingsIcon, Save, RefreshCw, AlertCircle, CheckCircle2, Cloud, HardDrive, ArrowLeft, Brain, Package, Plus, Trash2, Loader2, Sparkles, MessageSquare, Bell, Search } from 'lucide-react'
+import { Settings as SettingsIcon, Save, RefreshCw, AlertCircle, CheckCircle2, Cloud, HardDrive, ArrowLeft, Brain, Package, Plus, Trash2, Loader2, Sparkles, MessageSquare, Bell, Search, Shield } from 'lucide-react'
 import Link from 'next/link'
 import { toast, Toaster } from 'sonner'
 import {
@@ -12,9 +12,10 @@ import {
   listAvailableSkills, scanSkillDependencies,
   scanUnlistedPackages, adoptExistingPackage,
   getNodeStatus,
+  getSandboxStatus, setSandboxMode,
   type ModelSettings, type AvailableModels, type SkillPackage, type NotificationSettings,
   type LogSuggestion, type AvailableSkill, type SkillDependencies,
-  type UnlistedPackage, type NodeStatus,
+  type UnlistedPackage, type NodeStatus, type SandboxStatus,
 } from '@/lib/api'
 import { cn } from '@/lib/utils'
 
@@ -690,6 +691,157 @@ function NotificationSection() {
   )
 }
 
+// ── Skill Sandbox Section (V3) ────────────────────────────────────────────────
+function SandboxSection() {
+  const [status, setStatus] = useState<SandboxStatus | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [toggling, setToggling] = useState(false)
+
+  const reload = async (refresh = false) => {
+    try {
+      const s = await getSandboxStatus(refresh)
+      setStatus(s)
+    } catch (e) {
+      toast.error((e as Error).message)
+    }
+  }
+
+  useEffect(() => {
+    (async () => {
+      await reload(false)
+      setLoading(false)
+    })()
+  }, [])
+
+  const toggle = async () => {
+    if (!status) return
+    const next = status.mode === 'host' ? 'wsl_docker' : 'host'
+    // 切到 sandbox 前先提醒沒就緒
+    if (next === 'wsl_docker' && !status.ready) {
+      if (!confirm(`沙盒目前尚未就緒：\n\n${status.reasons.join('\n') || status.hint}\n\n仍然要切過去嗎？（Skill 執行會暫時 fallback 到 host）`)) {
+        return
+      }
+    }
+    setToggling(true)
+    try {
+      const updated = await setSandboxMode(next)
+      setStatus(updated)
+      toast.success(`已切換到${next === 'wsl_docker' ? '沙盒模式' : '本機模式'}`)
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setToggling(false)
+    }
+  }
+
+  const badge = (ok: boolean, label: string) => (
+    <span className={cn(
+      'inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full font-medium',
+      ok ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+         : 'bg-red-50 text-red-700 border border-red-200'
+    )}>
+      <span className={cn('w-1.5 h-1.5 rounded-full', ok ? 'bg-emerald-500' : 'bg-red-500')} />
+      {label}
+    </span>
+  )
+
+  return (
+    <div className="mt-8">
+      <div className="flex items-center gap-3 mb-4">
+        <div className="w-10 h-10 rounded-xl bg-indigo-100 flex items-center justify-center">
+          <Shield className="w-5 h-5 text-indigo-700" />
+        </div>
+        <div>
+          <h2 className="text-lg font-semibold text-gray-900">Skill 沙盒（V3）</h2>
+          <p className="text-sm text-gray-500">LLM 生成的 Python / Shell 程式碼要在哪裡執行</p>
+        </div>
+      </div>
+
+      {loading ? (
+        <div className="bg-white rounded-xl border border-gray-200 p-8 text-center text-gray-400">
+          <RefreshCw className="w-5 h-5 animate-spin inline-block mr-2" />偵測中…
+        </div>
+      ) : !status ? null : (
+        <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+          {/* Toggle row */}
+          <div className="p-5 border-b border-gray-100 flex items-start justify-between gap-4">
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-2 mb-1">
+                <span className="text-sm font-semibold text-gray-800">
+                  {status.mode === 'wsl_docker' ? '🛡 沙盒模式（WSL + Docker）' : '💻 本機模式（Host subprocess）'}
+                </span>
+              </div>
+              <p className="text-xs text-gray-500 leading-relaxed">
+                {status.mode === 'wsl_docker'
+                  ? 'Skill 節點 run_python / run_shell 送進 pipeline-sandbox 容器執行。computer_use / script 節點仍在 host 跑（需要桌面權限）。'
+                  : 'Skill 節點 run_python / run_shell 直接在 Windows 跑（速度快、跟 V2 一致）。LLM 能完整存取你的檔案系統。'}
+              </p>
+            </div>
+            <button
+              onClick={toggle}
+              disabled={toggling}
+              className={cn(
+                'relative w-12 h-7 rounded-full transition-colors shrink-0',
+                status.mode === 'wsl_docker' ? 'bg-indigo-500' : 'bg-gray-300',
+                toggling && 'opacity-50 cursor-not-allowed'
+              )}
+            >
+              <span className={cn(
+                'absolute top-0.5 left-0.5 w-6 h-6 rounded-full bg-white shadow transition-transform',
+                status.mode === 'wsl_docker' ? 'translate-x-5' : 'translate-x-0'
+              )} />
+            </button>
+          </div>
+
+          {/* Health */}
+          <div className="p-5 border-b border-gray-100">
+            <div className="flex items-center gap-2 mb-3">
+              <span className="text-sm font-semibold text-gray-800">沙盒健康狀態</span>
+              <button
+                onClick={() => reload(true)}
+                className="text-xs text-indigo-600 hover:text-indigo-700 flex items-center gap-1"
+              >
+                <RefreshCw className="w-3 h-3" />重新偵測
+              </button>
+            </div>
+            <div className="flex flex-wrap gap-2 mb-3">
+              {badge(status.wsl_ok, `WSL ${status.wsl_ok ? 'OK' : 'N/A'}`)}
+              {badge(status.docker_ok, `Docker ${status.docker_ok ? 'OK' : 'N/A'}`)}
+              {badge(status.container_running, `容器 ${status.container_running ? '執行中' : (status.container_exists ? '已停止' : '不存在')}`)}
+            </div>
+            {status.docker_version && (
+              <p className="text-xs text-gray-400 font-mono mb-2">{status.docker_version}</p>
+            )}
+            {status.reasons.length > 0 && (
+              <div className="mt-3 space-y-1">
+                {status.reasons.map((r, i) => (
+                  <div key={i} className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                    ⚠ {r}
+                  </div>
+                ))}
+              </div>
+            )}
+            {status.hint && !status.ready && (
+              <div className="mt-2 text-xs text-indigo-700 bg-indigo-50 border border-indigo-200 rounded-lg px-3 py-2">
+                💡 {status.hint}
+              </div>
+            )}
+          </div>
+
+          {/* Footer info */}
+          <div className="px-5 py-4 bg-gray-50/50 text-xs text-gray-500 space-y-1">
+            <p>• 首次使用沙盒需執行 <code className="font-mono bg-white px-1.5 py-0.5 rounded border">sandbox/setup_sandbox.bat</code>（約 3-5 分鐘）</p>
+            <p>• 模式切換即時生效，不用重啟後端</p>
+            <p>• 沙盒關閉/壞掉時自動 fallback 到 host 確保工作流能跑</p>
+            <p>• computer_use 節點永遠在 host 執行（需要桌面權限）</p>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+
 export default function SettingsPage() {
   const [current, setCurrent] = useState<ModelSettings | null>(null)
   const [available, setAvailable] = useState<AvailableModels | null>(null)
@@ -1164,6 +1316,9 @@ export default function SettingsPage() {
 
         {/* Notifications */}
         <NotificationSection />
+
+        {/* Skill Sandbox (V3) */}
+        <SandboxSection />
 
         {/* 提示 */}
         <div className="mt-4 text-xs text-gray-500 space-y-1">

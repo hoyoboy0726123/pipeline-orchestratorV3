@@ -672,6 +672,37 @@ async def put_notification_settings(req: NotificationSettingsRequest):
     }
 
 
+# ── Skill Sandbox (V3) ─────────────────────────────────────
+@app.get("/settings/sandbox")
+async def get_sandbox_status(refresh: bool = False):
+    """回傳沙盒目前狀態 + 設定模式，供前端顯示燈號與 toggle。"""
+    from settings import get_settings
+    from pipeline import sandbox as _sandbox
+    mode = (get_settings().get("skill_sandbox_mode") or "host").strip()
+    status = _sandbox.check_status(force_refresh=bool(refresh))
+    return {
+        "mode": mode,
+        **status,
+    }
+
+
+class SandboxModeRequest(BaseModel):
+    mode: str  # "host" | "wsl_docker"
+
+
+@app.put("/settings/sandbox")
+async def put_sandbox_mode(req: SandboxModeRequest):
+    """切換沙盒模式。切到 wsl_docker 時順便回傳目前健康狀態。"""
+    from settings import set_skill_sandbox_mode
+    from pipeline import sandbox as _sandbox
+    try:
+        updated = set_skill_sandbox_mode(req.mode)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    status = _sandbox.check_status(force_refresh=True)
+    return {"mode": updated.get("skill_sandbox_mode", "host"), **status}
+
+
 # ── Workflows CRUD ──────────────────────────────────────────
 class WorkflowRequest(BaseModel):
     name: str = "新工作流"
