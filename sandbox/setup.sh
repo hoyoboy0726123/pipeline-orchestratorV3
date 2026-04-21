@@ -127,7 +127,9 @@ if $DOCKER exec "$CONTAINER" python -c "import pandas, openpyxl, numpy, requests
     echo "══════════════════════════════════════════════════════"
     echo "✓ 沙盒就緒！"
     echo "  容器名：$CONTAINER"
-    echo "  掛載：$HOST_HOME_WSL → $HOST_HOME_WSL"
+    # 直接從容器 inspect 印出實際掛載，不依賴前面的本地變數
+    # （之前 refactor 改名後這行還引用舊變數 HOST_HOME_WSL 導致 set -u 報錯）
+    $DOCKER inspect "$CONTAINER" --format '{{range .Mounts}}    {{.Source}} → {{.Destination}}{{"\n"}}{{end}}' 2>/dev/null || true
     echo "══════════════════════════════════════════════════════"
 else
     echo "✗ 冒煙測試失敗，請檢查上面訊息"
