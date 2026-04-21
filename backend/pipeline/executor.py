@@ -700,7 +700,11 @@ def _try_sandbox_exec(tool_name: str, tool_input: str, cwd: Optional[str], run_i
         log.warning(f"[sandbox] import 失敗（fallback 到 host）：{e}")
         return None
 
-    mode = (get_settings().get("skill_sandbox_mode") or "host").strip()
+    settings_dict = get_settings()
+    mode = (settings_dict.get("skill_sandbox_mode") or "host").strip()
+    # 每次 skill tool 呼叫都 log 一下目前讀到什麼模式，方便追蹤使用者看到的 UI
+    # 跟後端實際決策有沒有差距（之前出現過 UI 顯示藍色但實際走 host 的懸案）
+    log.info(f"[sandbox] 檢查：skill_sandbox_mode={mode!r}（來自 settings cache）")
     if mode != "wsl_docker":
         return None
 
