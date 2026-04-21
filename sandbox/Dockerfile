@@ -31,9 +31,12 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir \
     requests beautifulsoup4 lxml "httpx[http2]"
 
-# ── Tier 3：繪圖/影像處理（重，單獨一層避免與 Tier 1/2 同時壓縮）──
-RUN pip install --no-cache-dir \
-    matplotlib opencv-python-headless
+# ── Tier 3a：繪圖（matplotlib + deps）──
+# 單獨一層，讓 layer commit 的資料量不會跟 Tier 3b 疊加
+RUN pip install --no-cache-dir matplotlib
+
+# ── Tier 3b：影像處理（opencv headless，最大的單一套件）──
+RUN pip install --no-cache-dir opencv-python-headless
 
 WORKDIR /project
 
