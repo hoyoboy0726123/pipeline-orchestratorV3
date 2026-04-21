@@ -660,12 +660,14 @@ def _parse_skill_tool_calls(text: str) -> list[dict]:
     return calls
 
 
-def _execute_skill_tool(tool_name: str, tool_input: str, cwd: Optional[str] = None, run_id: str = "") -> str:
+def _execute_skill_tool(tool_name: str, tool_input: str, cwd: Optional[str] = None, run_id: str = "",
+                        logger: Optional[logging.Logger] = None) -> str:
     """執行單一工具。
     若 settings.skill_sandbox_mode='wsl_docker' 且沙盒可用，run_python / run_shell
-    會走沙盒容器；其餘情況走原本 host subprocess。"""
+    會走沙盒容器；其餘情況走原本 host subprocess。
+    logger: per-step 的 pipeline logger（有寫到 .log 檔）；None 的話沙盒標記只會印到 backend stdout。"""
     if tool_name in ("run_python", "run_shell"):
-        sandbox_out = _try_sandbox_exec(tool_name, tool_input, cwd, run_id)
+        sandbox_out = _try_sandbox_exec(tool_name, tool_input, cwd, run_id, logger)
         if sandbox_out is not None:
             return sandbox_out
     if tool_name == "run_python":
@@ -685,10 +687,13 @@ def _execute_skill_tool(tool_name: str, tool_input: str, cwd: Optional[str] = No
 _SANDBOX_WARNED: set[str] = set()
 
 
-def _try_sandbox_exec(tool_name: str, tool_input: str, cwd: Optional[str], run_id: str) -> Optional[str]:
+def _try_sandbox_exec(tool_name: str, tool_input: str, cwd: Optional[str], run_id: str,
+                      logger: Optional[logging.Logger] = None) -> Optional[str]:
     """若 settings.skill_sandbox_mode='wsl_docker' 且沙盒可用，就把 run_python/run_shell
     送進 pipeline-sandbox 容器執行。回傳組好的 output 字串（格式對齊 host 版本）；
-    若 mode=host 或沙盒不可用則回傳 None 讓 caller fallback 到 host subprocess。"""
+    若 mode=host 或沙盒不可用則回傳 None 讓 caller fallback 到 host subprocess。
+    logger: per-step pipeline logger；若提供則沙盒標記會出現在 .log 檔，否則只出現在 backend stdout。"""
+    _lg = logger if logger is not None else log
     try:
         import sys as _sys
         _backend_dir = str(Path(__file__).resolve().parent.parent)
@@ -697,14 +702,14 @@ def _try_sandbox_exec(tool_name: str, tool_input: str, cwd: Optional[str], run_i
         from settings import get_settings
         from pipeline import sandbox as _sandbox
     except Exception as e:
-        log.warning(f"[sandbox] import 失敗（fallback 到 host）：{e}")
+        _lg.warning(f"[sandbox] import 失敗（fallback 到 host）：{e}")
         return None
 
     settings_dict = get_settings()
     mode = (settings_dict.get("skill_sandbox_mode") or "host").strip()
     # 每次 skill tool 呼叫都 log 一下目前讀到什麼模式，方便追蹤使用者看到的 UI
     # 跟後端實際決策有沒有差距（之前出現過 UI 顯示藍色但實際走 host 的懸案）
-    log.info(f"[sandbox] 檢查：skill_sandbox_mode={mode!r}（來自 settings cache）")
+    _lg.info(f"[sandbox] 檢查：skill_sandbox_mode={mode!r}（來自 settings cache）")
     if mode != "wsl_docker":
         return None
 
@@ -712,14 +717,14 @@ def _try_sandbox_exec(tool_name: str, tool_input: str, cwd: Optional[str], run_i
     if not ok:
         key = reason or "unknown"
         if key not in _SANDBOX_WARNED:
-            log.warning(f"[sandbox] 沙盒不可用，此次 fallback 到 host：{reason}")
+            _lg.warning(f"[sandbox] 沙盒不可用，此次 fallback 到 host：{reason}")
             _SANDBOX_WARNED.add(key)
         return None
     # 沙盒恢復健康後，清掉之前的告警記錄下次若又壞可再提醒
     if _SANDBOX_WARNED:
         _SANDBOX_WARNED.clear()
 
-    log.info(f"[sandbox] 🛡 在容器內執行 {tool_name}（{len(tool_input)} 字元）")
+    _lg.info(f"[sandbox] 🛡 在容器內執行 {tool_name}（{len(tool_input)} 字元）")
     if tool_name == "run_python":
         res = _sandbox.run_python(
             tool_input, cwd=cwd,
@@ -736,7 +741,7 @@ def _try_sandbox_exec(tool_name: str, tool_input: str, cwd: Optional[str], run_i
             register_cb=register_proc,
             unregister_cb=unregister_proc,
         )
-    log.info(f"[sandbox] ✓ 容器執行完畢 rc={res.returncode}"
+    _lg.info(f"[sandbox] ✓ 容器執行完畢 rc={res.returncode}"
              + (" (timed out)" if res.timed_out else ""))
 
     # 組裝輸出 — 格式刻意與 host 版本一致，LLM 分不出差別
@@ -1353,7 +1358,7 @@ async def execute_step_with_skill(
             # 執行工具
             logger.info(f"[{step_name}] 工具呼叫：{tool_name}")
             tool_result = await asyncio.get_event_loop().run_in_executor(
-                None, lambda tn=tool_name, ti=tool_input: _execute_skill_tool(tn, ti, cwd=working_dir, run_id=run_id)
+                None, lambda tn=tool_name, ti=tool_input, lg=logger: _execute_skill_tool(tn, ti, cwd=working_dir, run_id=run_id, logger=lg)
             )
             # 完整記錄工具結果（錯誤訊息如 ModuleNotFoundError 常超過 300 字）
             _tr_preview = tool_result if len(tool_result) <= 3000 else tool_result[:3000] + f"...[已截斷，完整長度 {len(tool_result)} 字]"
