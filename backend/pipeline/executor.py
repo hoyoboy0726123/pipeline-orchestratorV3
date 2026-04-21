@@ -22,6 +22,9 @@ from typing import Optional
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
 
+# 模組層 logger，給沒有 per-step logger 的輔助函式使用（例如沙盒路由）
+log = logging.getLogger(__name__)
+
 from config import GROQ_API_KEY, GROQ_MODEL_MAIN
 
 SKILL_TOOL_TIMEOUT = 60
