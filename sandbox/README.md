@@ -86,20 +86,24 @@ sudo docker rm -f pipeline-sandbox
 - 路徑翻譯：LLM 程式碼若用 Windows 絕對路徑 `C:\Users\...`，backend 會自動轉成 Linux `/mnt/c/Users/...`（映射同一份檔案）
 - Agent Skills：`~/.agents/skills/<skill_name>/` 在容器內也能用 `Path.home() / ".agents" / "skills" / ...` 讀到（`/root/.agents` 指向 host 的 `.agents`）
 
-## 調整 WSL 記憶體（重要：避免 build 時 OOM）
+## 如果 build 撞到 SIGBUS / OOM
 
-WSL2 預設記憶體上限是主機 RAM 的 50%（最多 8GB），但 Docker build 一次壓縮多個大型套件（numpy / opencv / matplotlib）時容易撞到。
+Docker build 壓縮 numpy / matplotlib / opencv 等大套件時，如果 WSL 的記憶體或磁碟不夠會直接 daemon crash：
 
-建立 `C:\Users\<你>\.wslconfig`：
+**先檢查磁碟**：C: 殘餘要至少 **8 GB**（Docker image + swap.vhdx 會佔空間）。低於這量會各種莫名其妙失敗。
+```powershell
+Get-PSDrive C
+```
 
+**記憶體不足**：手動建 `C:\Users\<你>\.wslconfig`：
 ```ini
 [wsl2]
 memory=8GB
 swap=16GB
-processors=auto
 ```
+然後 `wsl --shutdown`，下次啟動 WSL 吃新設定。
 
-然後 PowerShell 執行 `wsl --shutdown`，下次 WSL 啟動就吃新設定。
+Dockerfile 已經把 pip install 拆成多層（Tier 1 核心 / Tier 2 HTTP / Tier 3a matplotlib / Tier 3b opencv），單層 commit 壓力較小。預設 WSL 記憶體通常夠用，不用先動 `.wslconfig`。
 
 ## 疑難排解
 
