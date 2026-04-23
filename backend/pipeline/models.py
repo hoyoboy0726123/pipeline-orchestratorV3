@@ -80,6 +80,12 @@ class ComputerUseAction(BaseModel):
     modifiers: list[str] = []  # click 時按著的修飾鍵（如 ["ctrl"] 或 ["ctrl","shift"]）
     use_ocr: bool = False      # click_image 專用：顯式 OCR 啟用旗標。True 且 ocr_text 有值才跑 OCR
     ocr_text: str = ""         # OCR 目標文字（要跟 use_ocr=True 搭配才會生效）
+    # OCR 搜尋範圍（per-action 藍框，虛擬桌面絕對座標）。width=0 表示沒自訂，
+    # 回退使用 cv_search_radius 以紅十字為中心的預設區域
+    ocr_box_left: int = 0
+    ocr_box_top: int = 0
+    ocr_box_width: int = 0
+    ocr_box_height: int = 0
 
 
 class PipelineStep(BaseModel):
@@ -111,7 +117,11 @@ class PipelineStep(BaseModel):
     cv_search_radius: int = 400  # 附近搜尋半徑（像素）；實際搜尋範圍為 (2r × 2r)
     cv_trigger_hover: bool = True  # True = 比對前先把游標移到錄製座標並等，讓 Windows hover 效果出現
     cv_hover_wait_ms: int = 200    # hover 等待時間：200（快）/ 400（保險，Windows 部分動畫較慢）
-    cv_coord_fallback: bool = True # True = CV 完全找不到時，退回錄製座標硬點下去（跟 only_near 獨立，只搜附近模式也適用）
+    cv_coord_fallback: bool = False # True = CV 完全找不到時退回錄製座標硬點下去；False（預設）= 失敗就 FAIL 不亂點
+    # ── OCR 比對設定 ──────────────────────────────────────────────────
+    ocr_threshold: float = 0.6     # OCR 最小 confidence：低於這數字視為沒匹配到
+                                   # 分級: 1.0 精確 / 0.9 target⊆word / 0.8 跨詞行層級 / 0.6 模糊
+    ocr_cv_fallback: bool = False  # True = OCR 失敗時退到 CV 比對鏈（再受 cv_coord_fallback 接棒）；False（預設）= 失敗就 FAIL
 
 
 class PipelineConfig(BaseModel):

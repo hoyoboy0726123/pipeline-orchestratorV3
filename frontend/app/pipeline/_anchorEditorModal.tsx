@@ -9,6 +9,7 @@ interface Props {
   action: ComputerUseAction
   actionIndex: number
   assetsDir: string
+  defaultOcrRadius?: number  // 沒設定 ocr_box 時的預設半徑，一般是 step.cvSearchRadius
   onApply: (patch: Partial<ComputerUseAction>) => void
   onClose: () => void
 }
@@ -18,11 +19,14 @@ interface Props {
  * 顯示錄製當下的全螢幕截圖、點擊位置的紅十字、可拖曳的綠色裁切框。
  * 使用者按確認 → 呼叫後端裁出新錨點並更新 action。
  */
-export default function AnchorEditorModal({ action, actionIndex, assetsDir, onApply, onClose }: Props) {
+export default function AnchorEditorModal({ action, actionIndex, assetsDir, defaultOcrRadius, onApply, onClose }: Props) {
   // 目前僅支援有 full_image 的 action（新錄製才有）
   const fullImg = action.full_image || ''
   const fullLeft = action.full_left || 0
   const fullTop = action.full_top || 0
+
+  // 編輯模式：anchor = 綠框錨點 / ocr = 藍框 OCR 搜尋範圍
+  const [editMode, setEditMode] = useState<'anchor' | 'ocr'>('anchor')
 
   // 點擊位置（虛擬桌面絕對座標；可拖曳紅十字調整）
   const [clickPos, setClickPos] = useState(() => ({
@@ -30,13 +34,34 @@ export default function AnchorEditorModal({ action, actionIndex, assetsDir, onAp
     y: action.y || 0,
   }))
 
-  // 裁切框（虛擬桌面絕對座標）— 預設 240×80，之後會由已存的錨點圖尺寸反推取代
+  // 綠框：裁切範圍（虛擬桌面絕對座標）— 預設 240×80，之後會由已存的錨點圖尺寸反推取代
   const [box, setBox] = useState(() => ({
     left: (action.x || 0) - 120,
     top: (action.y || 0) - 40,
     width: 240,
     height: 80,
   }))
+
+  // 藍框：OCR 搜尋範圍（虛擬桌面絕對座標）
+  // 有存 ocr_box_* 就用存的；沒存就以點擊位置為中心、半徑用 defaultOcrRadius（預設 400）
+  const [ocrBox, setOcrBox] = useState(() => {
+    const hasSaved = (action.ocr_box_width || 0) > 0 && (action.ocr_box_height || 0) > 0
+    if (hasSaved) {
+      return {
+        left: action.ocr_box_left || 0,
+        top: action.ocr_box_top || 0,
+        width: action.ocr_box_width || 0,
+        height: action.ocr_box_height || 0,
+      }
+    }
+    const r = Math.max(80, defaultOcrRadius ?? 400)
+    return {
+      left: (action.x || 0) - r,
+      top: (action.y || 0) - r,
+      width: r * 2,
+      height: r * 2,
+    }
+  })
   // 開 Modal 時嘗試載入目前的錨點圖，從尺寸 + anchor_off_x/y 反推上次裁切框的位置
   // 這樣第二次開啟時框位置/大小 = 上次儲存的，不會退回預設 240×80
   useEffect(() => {
@@ -149,22 +174,29 @@ export default function AnchorEditorModal({ action, actionIndex, assetsDir, onAp
     ctx.lineWidth = 1.5
     ctx.stroke()
 
-    // 綠色裁切框
-    const bx = (box.left - fullLeft) * displayScale
-    const by = (box.top - fullTop) * displayScale
-    const bw = box.width * displayScale
-    const bh = box.height * displayScale
-    ctx.strokeStyle = '#10b981'
+    // 啟用中的框（綠框 = 錨點 / 藍框 = OCR 搜尋範圍）
+    const activeBox = editMode === 'ocr' ? ocrBox : box
+    const activeColor = editMode === 'ocr' ? '#3b82f6' : '#10b981'
+    const bx = (activeBox.left - fullLeft) * displayScale
+    const by = (activeBox.top - fullTop) * displayScale
+    const bw = activeBox.width * displayScale
+    const bh = activeBox.height * displayScale
+    // OCR 模式下畫半透明填色，讓「搜尋範圍」的視覺印象更直觀
+    if (editMode === 'ocr') {
+      ctx.fillStyle = 'rgba(59, 130, 246, 0.12)'
+      ctx.fillRect(bx, by, bw, bh)
+    }
+    ctx.strokeStyle = activeColor
     ctx.lineWidth = 2
     ctx.setLineDash([6, 4])
     ctx.strokeRect(bx, by, bw, bh)
     ctx.setLineDash([])
     // 四個角的小方塊當 resize handle
-    ctx.fillStyle = '#10b981'
+    ctx.fillStyle = activeColor
     const hs = 8
     ctx.fillRect(bx - hs / 2, by - hs / 2, hs, hs)                   // 左上
     ctx.fillRect(bx + bw - hs / 2, by + bh - hs / 2, hs, hs)         // 右下
-  }, [imgLoaded, displayScale, box, clickPos.x, clickPos.y, fullLeft, fullTop])
+  }, [imgLoaded, displayScale, box, ocrBox, editMode, clickPos.x, clickPos.y, fullLeft, fullTop])
 
   // 更新右側預覽
   useEffect(() => {
@@ -213,15 +245,16 @@ export default function AnchorEditorModal({ action, actionIndex, assetsDir, onAp
     const rect = canvasRef.current!.getBoundingClientRect()
     const cx = e.clientX - rect.left
     const cy = e.clientY - rect.top
-    // 紅十字優先判斷（在綠框內但靠近紅十字時優先拖紅十字）
+    // 紅十字優先判斷（在框內但靠近紅十字時優先拖紅十字）
     const crossX = (clickPos.x - fullLeft) * displayScale
     const crossY = (clickPos.y - fullTop) * displayScale
     const nearCross = Math.abs(cx - crossX) < 12 && Math.abs(cy - crossY) < 12
-    // 在哪個 handle 上？
-    const bx = (box.left - fullLeft) * displayScale
-    const by = (box.top - fullTop) * displayScale
-    const bw = box.width * displayScale
-    const bh = box.height * displayScale
+    // 當前啟用的框（綠 / 藍）
+    const activeBox = editMode === 'ocr' ? ocrBox : box
+    const bx = (activeBox.left - fullLeft) * displayScale
+    const by = (activeBox.top - fullTop) * displayScale
+    const bw = activeBox.width * displayScale
+    const bh = activeBox.height * displayScale
     const nearTL = Math.abs(cx - bx) < 10 && Math.abs(cy - by) < 10
     const nearBR = Math.abs(cx - (bx + bw)) < 10 && Math.abs(cy - (by + bh)) < 10
     const inside = cx >= bx && cx <= bx + bw && cy >= by && cy <= by + bh
@@ -234,7 +267,7 @@ export default function AnchorEditorModal({ action, actionIndex, assetsDir, onAp
     setDragMode(mode)
     dragRef.current = {
       startX: cx, startY: cy,
-      boxLeft: box.left, boxTop: box.top, boxW: box.width, boxH: box.height,
+      boxLeft: activeBox.left, boxTop: activeBox.top, boxW: activeBox.width, boxH: activeBox.height,
       clickX: clickPos.x, clickY: clickPos.y,
     }
     e.preventDefault()
@@ -252,16 +285,19 @@ export default function AnchorEditorModal({ action, actionIndex, assetsDir, onAp
         x: Math.round(dragRef.current.clickX + dx),
         y: Math.round(dragRef.current.clickY + dy),
       })
-    } else if (dragMode === 'move') {
-      setBox(b => ({ ...b, left: dragRef.current.boxLeft + Math.round(dx), top: dragRef.current.boxTop + Math.round(dy) }))
+      return
+    }
+    const setter = editMode === 'ocr' ? setOcrBox : setBox
+    if (dragMode === 'move') {
+      setter(b => ({ ...b, left: dragRef.current.boxLeft + Math.round(dx), top: dragRef.current.boxTop + Math.round(dy) }))
     } else if (dragMode === 'resize-br') {
-      setBox(b => ({
+      setter(b => ({
         ...b,
         width: Math.max(20, dragRef.current.boxW + Math.round(dx)),
         height: Math.max(20, dragRef.current.boxH + Math.round(dy)),
       }))
     } else if (dragMode === 'resize-tl') {
-      setBox(b => ({
+      setter(b => ({
         left: dragRef.current.boxLeft + Math.round(dx),
         top: dragRef.current.boxTop + Math.round(dy),
         width: Math.max(20, dragRef.current.boxW - Math.round(dx)),
@@ -272,8 +308,23 @@ export default function AnchorEditorModal({ action, actionIndex, assetsDir, onAp
 
   const onMouseUp = () => setDragMode('none')
 
-  // 確認：呼叫後端裁切
+  // 確認：依 mode 不同走不同路徑
+  //   anchor → 呼叫後端裁錨點 PNG、更新 image+offset
+  //   ocr    → 純前端存 ocr_box_* 座標、自動啟用 use_ocr
   const handleConfirm = async () => {
+    if (editMode === 'ocr') {
+      onApply({
+        ocr_box_left: ocrBox.left,
+        ocr_box_top: ocrBox.top,
+        ocr_box_width: ocrBox.width,
+        ocr_box_height: ocrBox.height,
+        // 套用藍框 = 明確想走 OCR；自動勾 use_ocr，避免使用者忘記勾 checkbox
+        use_ocr: true,
+      })
+      toast.success(`OCR 搜尋範圍已更新（${ocrBox.width}×${ocrBox.height}）`)
+      onClose()
+      return
+    }
     try {
       const saveAs = `img_${String(actionIndex + 1).padStart(3, '0')}_manual.png`
       const res = await cropAnchorFromFull({
@@ -306,10 +357,26 @@ export default function AnchorEditorModal({ action, actionIndex, assetsDir, onAp
     }
   }
 
-  // 重置：回到預設 240×80 以點擊點為中心
+  // 重置：依 mode 回到預設
   const handleReset = () => {
-    setBox({ left: clickPos.x - 120, top: clickPos.y - 40, width: 240, height: 80 })
+    if (editMode === 'ocr') {
+      const r = Math.max(80, defaultOcrRadius ?? 400)
+      setOcrBox({ left: clickPos.x - r, top: clickPos.y - r, width: r * 2, height: r * 2 })
+    } else {
+      setBox({ left: clickPos.x - 120, top: clickPos.y - 40, width: 240, height: 80 })
+    }
   }
+
+  // OCR 範圍面積（用於效能提醒）
+  const ocrArea = ocrBox.width * ocrBox.height
+  // 經驗值：全 1080p (~2M px²) 大約 400-800ms，半屏 (~1M) 約 150-300ms
+  const ocrPerfTier: 'fast' | 'medium' | 'slow' =
+    ocrArea < 800_000 ? 'fast' : ocrArea < 2_000_000 ? 'medium' : 'slow'
+  const ocrPerfNote = {
+    fast:   { color: 'bg-blue-50 border-blue-200 text-blue-800',      text: '⚡ 範圍小 → OCR 速度快（約 <200ms）' },
+    medium: { color: 'bg-amber-50 border-amber-200 text-amber-800',   text: '⚠️ 範圍中等 → OCR 約 200-500ms，可接受' },
+    slow:   { color: 'bg-rose-50 border-rose-200 text-rose-800',      text: '🐢 範圍很大 → OCR 可能 >500ms，影響動作節奏。建議盡量縮到目標文字附近。' },
+  }[ocrPerfTier]
 
   if (!fullImg) {
     return (
@@ -363,6 +430,25 @@ export default function AnchorEditorModal({ action, actionIndex, assetsDir, onAp
         {/* Header */}
         <div className="flex items-center gap-3 px-5 py-3 border-b border-gray-100">
           <h3 className="font-semibold text-gray-800">✏️ 編輯錨點 — 動作 #{actionIndex + 1}</h3>
+          {/* 模式切換：綠框錨點 ↔ 藍框 OCR 範圍 */}
+          <div className="flex items-center gap-0 ml-4 border border-gray-200 rounded-lg overflow-hidden text-xs">
+            <button
+              onClick={() => setEditMode('anchor')}
+              className={`px-3 py-1.5 transition-colors ${
+                editMode === 'anchor'
+                  ? 'bg-emerald-500 text-white font-semibold'
+                  : 'bg-white text-gray-600 hover:bg-gray-50'
+              }`}
+            >🟩 錨點範圍</button>
+            <button
+              onClick={() => setEditMode('ocr')}
+              className={`px-3 py-1.5 transition-colors ${
+                editMode === 'ocr'
+                  ? 'bg-blue-500 text-white font-semibold'
+                  : 'bg-white text-gray-600 hover:bg-gray-50'
+              }`}
+            >🟦 OCR 搜尋範圍</button>
+          </div>
           <div className="flex-1" />
           <button onClick={onClose} className="text-gray-400 hover:text-gray-600"><X className="w-4 h-4" /></button>
         </div>
@@ -383,52 +469,93 @@ export default function AnchorEditorModal({ action, actionIndex, assetsDir, onAp
 
           {/* 右側：預覽 + 控制 */}
           <div className="w-72 border-l border-gray-200 flex flex-col p-4 space-y-3 overflow-y-auto">
-            <div>
-              <div className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">錨點預覽</div>
-              {preview && (
-                <img src={preview} alt="anchor preview"
-                  // pixelated：禁用瀏覽器內建 bilinear 平滑，pixel-level 清晰，
-                  // 對 240x80 這種小圖放大顯示時避免字邊模糊
-                  style={{ imageRendering: 'pixelated' }}
-                  className="border border-gray-300 bg-checkered w-full" />
-              )}
-              <div className="text-xs text-gray-500 mt-1 font-mono">
-                {box.width} × {box.height} px
-              </div>
-            </div>
+            {editMode === 'anchor' ? (
+              <>
+                <div>
+                  <div className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">錨點預覽</div>
+                  {preview && (
+                    <img src={preview} alt="anchor preview"
+                      // pixelated：禁用瀏覽器內建 bilinear 平滑，pixel-level 清晰，
+                      // 對 240x80 這種小圖放大顯示時避免字邊模糊
+                      style={{ imageRendering: 'pixelated' }}
+                      className="border border-gray-300 bg-checkered w-full" />
+                  )}
+                  <div className="text-xs text-gray-500 mt-1 font-mono">
+                    {box.width} × {box.height} px
+                  </div>
+                </div>
 
-            <div className={`p-3 border rounded-lg ${sizeGuidance.color}`}>
-              <div className={`text-sm font-bold mb-1 ${sizeGuidance.titleColor}`}>
-                {sizeGuidance.icon} {sizeGuidance.title}
-              </div>
-              <div className="text-xs leading-relaxed">{sizeGuidance.desc}</div>
-              <div className="text-[11px] text-gray-500 mt-2 pt-2 border-t border-current opacity-60 font-mono">
-                面積 {boxArea.toLocaleString()} px² · variance {variance}
-              </div>
-            </div>
+                <div className={`p-3 border rounded-lg ${sizeGuidance.color}`}>
+                  <div className={`text-sm font-bold mb-1 ${sizeGuidance.titleColor}`}>
+                    {sizeGuidance.icon} {sizeGuidance.title}
+                  </div>
+                  <div className="text-xs leading-relaxed">{sizeGuidance.desc}</div>
+                  <div className="text-[11px] text-gray-500 mt-2 pt-2 border-t border-current opacity-60 font-mono">
+                    面積 {boxArea.toLocaleString()} px² · variance {variance}
+                  </div>
+                </div>
 
-            <div className="p-2 bg-gray-50 rounded-lg text-xs text-gray-600 space-y-1">
-              <div>🎯 紅色十字 = 點擊位置 <b className="text-red-600">（可拖曳調整）</b></div>
-              <div>🟩 綠框 = 錨點範圍（拖中間移動、拖左上/右下角改大小）</div>
-              <div className="text-gray-500 pt-1 border-t border-gray-200">
-                座標：({clickPos.x}, {clickPos.y})
-              </div>
-            </div>
-            <div className="p-2 bg-purple-50 border border-purple-200 rounded-lg text-xs text-purple-800 leading-relaxed">
-              <strong>🔍 套用後會自動啟用圖像比對模式</strong><br/>
-              執行時會用這個錨點在當前畫面找位置，UI 跑掉也能追著目標點。
-              點擊位置 = 錨點被找到的位置 + 紅十字相對錨點的偏移。
-            </div>
+                <div className="p-2 bg-gray-50 rounded-lg text-xs text-gray-600 space-y-1">
+                  <div>🎯 紅色十字 = 點擊位置 <b className="text-red-600">（可拖曳調整）</b></div>
+                  <div>🟩 綠框 = 錨點範圍（拖中間移動、拖左上/右下角改大小）</div>
+                  <div className="text-gray-500 pt-1 border-t border-gray-200">
+                    座標：({clickPos.x}, {clickPos.y})
+                  </div>
+                </div>
+                <div className="p-2 bg-purple-50 border border-purple-200 rounded-lg text-xs text-purple-800 leading-relaxed">
+                  <strong>🔍 套用後會自動啟用圖像比對模式</strong><br/>
+                  執行時會用這個錨點在當前畫面找位置，UI 跑掉也能追著目標點。
+                  點擊位置 = 錨點被找到的位置 + 紅十字相對錨點的偏移。
+                </div>
+              </>
+            ) : (
+              <>
+                <div>
+                  <div className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">OCR 搜尋範圍</div>
+                  <div className="text-xs text-gray-600 leading-relaxed">
+                    OCR 會只掃藍框內的文字。框越小速度越快、誤判越少；框越大覆蓋越廣但也越慢。
+                  </div>
+                  <div className="text-xs text-gray-500 mt-2 font-mono">
+                    {ocrBox.width} × {ocrBox.height} px · 面積 {ocrArea.toLocaleString()} px²
+                  </div>
+                  <div className="text-[11px] text-gray-400 mt-0.5 font-mono">
+                    left={ocrBox.left} top={ocrBox.top}
+                  </div>
+                </div>
+
+                <div className={`p-3 border rounded-lg text-xs leading-relaxed ${ocrPerfNote.color}`}>
+                  {ocrPerfNote.text}
+                </div>
+
+                <div className="p-2 bg-gray-50 rounded-lg text-xs text-gray-600 space-y-1">
+                  <div>🎯 紅色十字 = 點擊位置 <b className="text-red-600">（可拖曳調整）</b></div>
+                  <div>🟦 藍框 = OCR 搜尋範圍（拖中間移動、拖左上/右下角改大小）</div>
+                  <div className="text-gray-500 pt-1 border-t border-gray-200">
+                    點擊座標：({clickPos.x}, {clickPos.y})
+                  </div>
+                </div>
+                <div className="p-2 bg-blue-50 border border-blue-200 rounded-lg text-xs text-blue-800 leading-relaxed">
+                  <strong>🔤 套用後會自動啟用 OCR 模式</strong><br/>
+                  執行時會在藍框裡搜尋 <code className="px-1 bg-white rounded">ocr_text</code> 設定的文字，找到就點文字中心。
+                  不影響圖像比對（若 OCR 失敗且有啟用 ocr_cv_fallback，才會退回綠框錨點）。
+                </div>
+              </>
+            )}
 
             <div className="flex-1" />
 
             <button onClick={handleReset}
               className="flex items-center justify-center gap-1.5 px-3 py-2 border border-gray-200 rounded-lg text-sm text-gray-600 hover:bg-gray-50">
-              <RotateCcw className="w-3.5 h-3.5" /> 重置（以點擊點為中心 240×80）
+              <RotateCcw className="w-3.5 h-3.5" />
+              {editMode === 'ocr'
+                ? `重置（以點擊點為中心 ${(defaultOcrRadius ?? 400) * 2}×${(defaultOcrRadius ?? 400) * 2}）`
+                : '重置（以點擊點為中心 240×80）'}
             </button>
 
             <button onClick={handleConfirm}
-              className="flex items-center justify-center gap-1.5 px-3 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg text-sm font-medium">
+              className={`flex items-center justify-center gap-1.5 px-3 py-2 text-white rounded-lg text-sm font-medium ${
+                editMode === 'ocr' ? 'bg-blue-600 hover:bg-blue-700' : 'bg-purple-600 hover:bg-purple-700'
+              }`}>
               <Check className="w-4 h-4" /> 確認套用
             </button>
           </div>

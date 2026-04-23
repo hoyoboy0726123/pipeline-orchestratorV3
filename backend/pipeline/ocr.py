@@ -185,10 +185,13 @@ def find_text_on_screen(
     lang_tag: Optional[str] = "zh-Hant-TW",
     near_xy: Optional[tuple[int, int]] = None,
     search_radius: int = 400,
+    threshold: float = 0.6,
+    region: Optional[tuple[int, int, int, int]] = None,
 ) -> OcrMatch:
     """同步介面：在螢幕截圖裡找目標文字。
     - screen_bgr: cv2 擷取的 BGR ndarray（來自 mss 再 cvtColor）
     - origin_x/y: 截圖的桌面原點（mss.monitors[0] 的 left/top）
+    - region: 顯式裁切區域（絕對桌面座標 left, top, width, height）。優先於 near_xy
     - near_xy: 若給，先裁切該區域再做 OCR（速度快、避開跨螢幕假陽性）
     - search_radius: 附近半徑（同 CV 的 cv_search_radius）
     回傳 OcrMatch.center 是絕對桌面座標。
@@ -196,13 +199,25 @@ def find_text_on_screen(
     if not target or not target.strip():
         return OcrMatch(False, reason="ocr_text 為空")
 
-    # 若有 near_xy 就先裁切，縮短 OCR 時間且降低誤找
     clip_x, clip_y = origin_x, origin_y
-    if near_xy is not None:
+    H, W = screen_bgr.shape[:2]
+    if region is not None and region[2] > 0 and region[3] > 0:
+        # 顯式 region（藍框）優先：轉成相對截圖座標再裁切
+        rl, rt, rw, rh = region
+        rel_left = max(0, rl - origin_x)
+        rel_top = max(0, rt - origin_y)
+        rel_right = min(W, rl - origin_x + rw)
+        rel_bottom = min(H, rt - origin_y + rh)
+        if rel_right - rel_left < 20 or rel_bottom - rel_top < 20:
+            return OcrMatch(False, reason=f"region ({rl},{rt},{rw},{rh}) 超出螢幕範圍")
+        screen_bgr = screen_bgr[rel_top:rel_bottom, rel_left:rel_right]
+        clip_x = origin_x + rel_left
+        clip_y = origin_y + rel_top
+    elif near_xy is not None:
+        # 沒 region 時退回 near_xy + radius
         nx, ny = near_xy
         rel_x = nx - origin_x
         rel_y = ny - origin_y
-        H, W = screen_bgr.shape[:2]
         left = max(0, rel_x - search_radius)
         top = max(0, rel_y - search_radius)
         right = min(W, rel_x + search_radius)
@@ -231,6 +246,19 @@ def find_text_on_screen(
         return OcrMatch(False, reason=f"OCR 例外：{type(e).__name__}: {e}")
 
     hit = _find_target_in_words(words, target)
+    # 套用使用者設定的門檻：低於 threshold 的匹配視為失敗（例如只有模糊 0.6 但要求 0.8）
+    if hit is not None:
+        _, conf = hit
+        if conf < threshold:
+            by_line_tmp: dict[int, list[dict]] = {}
+            for _w in words:
+                by_line_tmp.setdefault(_w["line_index"], []).append(_w)
+            return OcrMatch(
+                False,
+                reason=f"OCR 找到 '{target}' 但 conf={conf:.2f} 低於門檻 {threshold}（level-1 精確/0.9 word/0.8 line/0.6 模糊）",
+                ocr_words_count=len(words),
+                confidence=conf,
+            )
     if hit is None:
         # Debug：印出前幾行「拼起來」的內容（去空白），比列單詞更好判斷
         # （OCR 對 CJK 會把每個字拆成獨立 word，看單詞看不出文字結構）

@@ -254,7 +254,9 @@ def execute_action(
     cv_search_radius: int = 400,
     cv_trigger_hover: bool = True,
     cv_hover_wait_ms: int = 200,
-    cv_coord_fallback: bool = True,
+    cv_coord_fallback: bool = False,
+    ocr_threshold: float = 0.6,
+    ocr_cv_fallback: bool = False,
 ) -> ActionResult:
     """執行單一 action。action 是 ComputerUseAction.model_dump() 結果的 dict。"""
     t0 = time.time()
@@ -284,9 +286,20 @@ def execute_action(
             modifiers = list(action.get("modifiers", []) or [])
             mods_tag = f"[{'+'.join(modifiers)}]" if modifiers else ""
 
+            # 三種 primary mode 獨立互不 coupling（per user feedback），但執行時還是要
+            # 有優先順序。直覺是「使用者明確勾起來的 mode 優先」：
+            #   OCR 勾起 + 有 ocr_text → 走 OCR（不管 use_coord 是 true/false）
+            #   OCR 沒勾 + use_coord=true → 走絕對座標
+            #   OCR 沒勾 + use_coord=false → 走 CV 圖像比對
+            # 先讀 OCR 旗標，再決定是否短路到座標模式
+            use_ocr = bool(action.get("use_ocr", False))
+            ocr_text = (action.get("ocr_text") or "").strip()
+            ocr_will_run = use_ocr and bool(ocr_text)
+
             # 預設使用絕對座標（快速且穩定）；只有使用者主動切到圖像比對模式才跑 template matching
             # 注意：get 第二引數 True 表示若 action 根本沒 use_coord 欄位，也視為座標模式
-            if action.get("use_coord", True) and has_coord:
+            # OCR 有啟用就跳過座標短路，讓 OCR 先試（失敗再依 ocr_cv_fallback 決定退不退）
+            if action.get("use_coord", True) and has_coord and not ocr_will_run:
                 _do_click(pg, int(fx), int(fy), button, clicks, hold_sec, modifiers)
                 hold_tag = f" hold={hold_sec}s" if hold_sec > 0.1 else ""
                 msg = f"[強制座標]{mods_tag} 點擊 ({fx},{fy}) button={button} clicks={clicks}{hold_tag}"
@@ -297,7 +310,8 @@ def execute_action(
             # Hover 預熱：錄製當下游標停在按鈕上、錨點擷取到 Windows hover highlight
             # 狀態；回放用 pyautogui 瞬移沒觸發 hover → 螢幕與錨點不一樣 conf 掉
             # 把游標移到錄製座標附近、等指定 ms 讓 hover 效果渲染後再比對
-            if cv_trigger_hover and has_coord:
+            # OCR 模式跳過 hover（純文字偵測不受 hover 影響，而且可能反而干擾游標位置）
+            if cv_trigger_hover and has_coord and not ocr_will_run:
                 try:
                     pg.moveTo(int(fx), int(fy))
                     time.sleep(max(50, int(cv_hover_wait_ms)) / 1000.0)
@@ -305,38 +319,57 @@ def execute_action(
                     pass  # 移動失敗就略過（例如座標超出螢幕），後面搜尋仍然照跑
 
             # ── OCR 模式分支 ──
-            # 只有 use_ocr=True 且 ocr_text 有值才會跑（前端 checkbox 明確啟用）
-            # 避免舊版「填了 ocr_text 但 use_coord 仍 true → OCR 根本沒跑」的 silent bug
-            use_ocr = bool(action.get("use_ocr", False))
-            ocr_text = (action.get("ocr_text") or "").strip()
-            if use_ocr and ocr_text:
+            # 只有 use_ocr=True 且 ocr_text 有值才跑。OCR 失敗時的後續行為由 ocr_cv_fallback 控制：
+            #   ocr_cv_fallback=False（預設）→ 失敗立即 FAIL（符合「選 OCR 就代表 CV 不適用」的直覺）
+            #   ocr_cv_fallback=True         → 失敗繼續走下面的 CV 比對鏈（再受 cv_coord_fallback 接棒）
+            if ocr_will_run:
+                find_text_on_screen = None
                 try:
                     from pipeline.ocr import find_text_on_screen
                 except Exception:
                     try:
                         from .ocr import find_text_on_screen  # type: ignore
                     except Exception as _e:
-                        find_text_on_screen = None
-                        logger.warning(f"[computer_use]   ⚠ 無法載入 OCR 模組：{_e}；改用 CV 比對")
+                        logger.error(f"[computer_use]   ✗ 無法載入 OCR 模組：{_e}")
                 if find_text_on_screen is not None:
                     screen_bgr, sx, sy = _capture_screen()
                     near = (int(fx), int(fy)) if has_coord else None
+                    # 藍框：per-action 顯式 OCR 搜尋範圍（絕對桌面座標）
+                    ocr_region = None
+                    _box_w = int(action.get("ocr_box_width", 0) or 0)
+                    _box_h = int(action.get("ocr_box_height", 0) or 0)
+                    if _box_w > 0 and _box_h > 0:
+                        ocr_region = (
+                            int(action.get("ocr_box_left", 0) or 0),
+                            int(action.get("ocr_box_top", 0) or 0),
+                            _box_w,
+                            _box_h,
+                        )
                     ocr_res = find_text_on_screen(
                         screen_bgr, ocr_text, origin_x=sx, origin_y=sy,
                         lang_tag="zh-Hant-TW",
                         near_xy=near, search_radius=cv_search_radius,
+                        threshold=ocr_threshold,
+                        region=ocr_region,
                     )
                     if ocr_res.found:
                         _do_click(pg, ocr_res.center[0], ocr_res.center[1],
                                   button, clicks, hold_sec, modifiers)
                         hold_tag = f" hold={hold_sec}s" if hold_sec > 0.1 else ""
                         msg = (f"{mods_tag} 點擊 OCR 文字 '{ocr_text}' @ {ocr_res.center} "
-                               f"(matched='{ocr_res.text[:30]}', conf={ocr_res.confidence}){hold_tag}")
+                               f"(matched='{ocr_res.text[:30]}', conf={ocr_res.confidence:.2f}){hold_tag}")
                         duration = int((time.time() - t0) * 1000)
                         logger.info(f"[computer_use]   ✓ {msg}（{duration}ms）")
                         return ActionResult(True, index, atype, msg, duration)
-                    # ocr_res.reason 裡已經包含「OCR 沒找到 ...」字樣，直接印它不用再包裝
-                    logger.info(f"[computer_use]   {ocr_res.reason[:120]}，改用 CV 比對")
+                    # OCR 失敗
+                    if not ocr_cv_fallback:
+                        fail_msg = f"{ocr_res.reason}（ocr_cv_fallback=off → 失敗直接 FAIL 不退回 CV/座標）"
+                        logger.error(f"[computer_use]   ✗ {fail_msg}")
+                        return ActionResult(False, index, atype, fail_msg)
+                    logger.info(f"[computer_use]   {ocr_res.reason[:120]}，ocr_cv_fallback=on → 改試 CV 比對")
+                elif not ocr_cv_fallback:
+                    # OCR 模組載不進來且使用者沒開 fallback → 直接 FAIL（不偷偷走 CV）
+                    return ActionResult(False, index, atype, "OCR 模組無法載入且 ocr_cv_fallback=off")
 
             # 搜尋策略：
             # 1. 有錄製座標 → 先在附近 ±cv_search_radius 範圍搜尋（防跨螢幕假陽性）
@@ -702,7 +735,9 @@ def execute_computer_use_step(
     cv_search_radius: int = 400,
     cv_trigger_hover: bool = True,
     cv_hover_wait_ms: int = 200,
-    cv_coord_fallback: bool = True,
+    cv_coord_fallback: bool = False,
+    ocr_threshold: float = 0.6,
+    ocr_cv_fallback: bool = False,
 ) -> StepResult:
     """執行一整個 computer_use 步驟。
 
@@ -751,7 +786,9 @@ def execute_computer_use_step(
                                  cv_search_radius=cv_search_radius,
                                  cv_trigger_hover=cv_trigger_hover,
                                  cv_hover_wait_ms=cv_hover_wait_ms,
-                                 cv_coord_fallback=cv_coord_fallback)
+                                 cv_coord_fallback=cv_coord_fallback,
+                                 ocr_threshold=ocr_threshold,
+                                 ocr_cv_fallback=ocr_cv_fallback)
         except RuntimeError as abort_err:
             logger.warning(f"[computer_use] {abort_err}")
             return StepResult(
