@@ -1116,6 +1116,35 @@ async def execute_step_with_skill(
 仍然受 ask_user 次數上限（{ASK_USER_MAX}）保護，不會無限問。"""
         logger.info(f"[{step_name}] ❓ 詢問模式已啟用（LLM 遇到模糊處會主動問使用者）")
 
+    # ── 沙盒環境提示（僅在 wsl_docker 模式注入）──
+    # Host 模式在 Windows 上跑，agent 用 Windows 路徑 / win32com 都 OK；
+    # wsl_docker 模式在 Linux 容器，需要告訴 agent「你不在 Windows」避免浪費迭代
+    # （實測 agent 常犯：用 C:\ 路徑、呼叫 win32com、以為有 PowerShell 等）
+    try:
+        import sys as _sys2
+        _backend_dir2 = str(Path(__file__).parent.parent.absolute())
+        if _backend_dir2 not in _sys2.path:
+            _sys2.path.insert(0, _backend_dir2)
+        from settings import get_settings as _get_settings_for_sandbox
+        if (_get_settings_for_sandbox().get("skill_sandbox_mode") or "host").strip() == "wsl_docker":
+            system_prompt += r"""
+
+【🛡️ Sandbox 環境資訊（重要，務必遵守）】
+本步驟的 run_python / run_shell **在 Linux Docker 容器內執行**（python:3.13-slim），不是 Windows host：
+- **OS = Linux**：沒有 win32com / pywin32 / PowerShell / cmd.exe，直接忽略它們，用純 Python 或 Linux 工具
+- **產生 PPT**：容器已預裝 `python-pptx`（首選）與 Node.js + `pptxgenjs`（走 `.agents/skills/pptx`）
+  — **不要 import win32com.client**，它在容器裡永遠 ImportError
+- **路徑轉換**：Windows 格式 `C:\...` 或 `C:/...` 在容器無效，pathlib 會當相對路徑處理導致找不到檔：
+  - 把 `C:\Users\X\...` 轉成 `/mnt/c/Users/X/...`
+  - 把 `D:\data\...` 轉成 `/mnt/d/data/...`
+  - 容器裡 `~` (`/root`) 有 mount `.agents`，所以 `Path.home() / ".agents"` 跟 `/mnt/c/Users/X/.agents` 指同一份
+- **PATH 上只有 Linux 工具**：`node`、`npm`、`python3`、`bash`、`ls`、`grep`、`curl` 等都有；
+  沒有 `where`、`dir`、`type`、`copy` 這些 Windows 命令
+- 任務描述若給了 Windows 風格的路徑，自動轉成 `/mnt/<drive>/...` 再使用"""
+            logger.info(f"[{step_name}] 🛡 已注入 wsl_docker sandbox 環境資訊")
+    except Exception as _e:
+        logger.debug(f"[{step_name}] sandbox env 注入失敗（略過）：{_e}")
+
     # 掛載 skill：注入 SKILL.md 內容與子資源清單
     if skill_name:
         try:

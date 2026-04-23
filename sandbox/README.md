@@ -19,7 +19,9 @@ Windows host
                    └─ Docker Engine
                         └─ pipeline-sandbox 容器（長駐）
                              - Python 3.13
-                             - 預裝 pandas / openpyxl / numpy / requests / ...
+                             - 預裝：pandas / openpyxl / numpy / matplotlib / opencv-headless
+                               / python-pptx / pdfplumber / newspaper3k / cloudscraper / feedparser
+                             - Node.js + pptxgenjs（對應 `.agents/skills/pptx`）
                              - Bind mounts（三條，路徑全部 1:1 映射，容器內外同路徑）：
                                • 專案本體：C:\...\pipeline-orchestratorV3
                                         → /mnt/c/.../pipeline-orchestratorV3
@@ -33,6 +35,22 @@ Windows host
 1. 雙擊 `setup_sandbox.bat`
 2. 如果提示沒 WSL，按提示在管理員 PowerShell 執行 `wsl --install` 並重啟，然後再跑一次 `setup_sandbox.bat`
 3. 完成後可看到 `✓ 沙盒就緒！`
+
+## 升級已安裝的沙盒（改了 Dockerfile / requirements.txt 之後）
+
+預設重跑 `setup_sandbox.bat` **不會** rebuild（偵測到 image 存在就跳過，避免每次啟動都等 10 分鐘）。
+改了 Dockerfile 或 requirements.txt 後要生效：
+
+```cmd
+setup_sandbox.bat --rebuild
+```
+
+這會：
+1. 強制移除舊 container `pipeline-sandbox` 與 image `pipeline-sandbox:latest`
+2. 從 Dockerfile 重新 build（`--no-cache`，確保新套件真的裝進去）
+3. 重新啟動容器（沿用原本的 bind mount 策略）
+
+約 5-10 分鐘。
 
 檔案清單：
 - `Dockerfile` — 沙盒映像檔定義（Python 3.13 slim + 常用資料套件）
@@ -72,10 +90,9 @@ sudo docker exec -it pipeline-sandbox bash
 # 加新 Python 套件（臨時）
 sudo docker exec pipeline-sandbox pip install <package>
 
-# 修改 requirements.txt 後永久加：重 build image
-sudo docker build -t pipeline-sandbox:latest /mnt/c/Users/<you>/pipeline-orchestratorV3/sandbox
-sudo docker rm -f pipeline-sandbox
-# 然後再跑 setup_sandbox.bat 讓容器重新起來
+# 修改 requirements.txt 後永久加：從 Windows 跑
+#   setup_sandbox.bat --rebuild
+# （自動砍 container + image，重 build 並重建容器）
 ```
 
 ## 限制

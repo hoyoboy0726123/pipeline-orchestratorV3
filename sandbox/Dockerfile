@@ -38,6 +38,24 @@ RUN pip install --no-cache-dir matplotlib
 # ── Tier 3b：影像處理（opencv headless，最大的單一套件）──
 RUN pip install --no-cache-dir opencv-python-headless
 
+# ── Tier 4：文件產出（PPT / PDF）──
+# python-pptx：Python 原生產 PPT；pdfplumber：PDF 文字抽取
+RUN pip install --no-cache-dir python-pptx pdfplumber
+
+# ── Tier 5：爬蟲進階（新聞 + Cloudflare 繞過 + RSS）──
+# newspaper3k 會拉 nltk / tldextract / feedparser（~100MB）；cloudscraper 繞 CF 5s 挑戰
+# lxml_html_clean：lxml 5.x 後 html.clean 被拆成獨立套件，newspaper3k 需要
+RUN pip install --no-cache-dir newspaper3k cloudscraper feedparser lxml_html_clean
+
+# ── Tier 6：Node.js runtime + pptxgenjs（JS 版 PPT 產生器）──
+# debian 12 預設 nodejs 是 v18，對 pptxgenjs 3.x 足夠用
+# 把 node + pptxgenjs 放在這，這樣 LLM agent 收到 `.agents/skills/pptx` skill 時能直接 `require('pptxgenjs')`
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        nodejs npm \
+    && rm -rf /var/lib/apt/lists/*
+RUN npm install -g pptxgenjs \
+    && npm cache clean --force
+
 WORKDIR /project
 
 # tail -f /dev/null：讓容器保持 running 等 exec 指令

@@ -25,6 +25,15 @@ httpx[http2]
 matplotlib
 opencv-python-headless
 
-# ── Tier 4：其他常用（可省）──
-# 不包含：selenium / newspaper3k / yfinance / markitdown[pptx] / cloudscraper
-#   （裝起來又重又慢，需要再另裝即可）
+# ── Tier 4：文件產出（PPT / PDF）──
+python-pptx
+pdfplumber
+
+# ── Tier 5：爬蟲進階（常見新聞/Cloudflare 繞過）──
+# newspaper3k：內建 Article 解析（會牽出 nltk / feedparser / tldextract 等）
+# cloudscraper：繞 Cloudflare 5s 挑戰
+# feedparser：RSS / Atom 獨立使用
+newspaper3k
+cloudscraper
+feedparser
+lxml_html_clean

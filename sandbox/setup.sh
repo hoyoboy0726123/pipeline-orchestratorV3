@@ -8,13 +8,25 @@
 #   3. 啟動長駐容器 pipeline-sandbox（bind mount 專案根目錄）
 #
 # 之後 backend 會透過 `wsl docker exec pipeline-sandbox ...` 執行 skill 程式碼。
+#
+# 用法：
+#   setup.sh <project_dir_in_wsl>              # 一般安裝（跳過已存在的 image / container）
+#   setup.sh <project_dir_in_wsl> --rebuild    # 強制 rebuild image + 重建 container
+#                                              # （改了 Dockerfile / requirements.txt 後用）
 set -euo pipefail
 
-# ── 參數：專案根目錄（WSL 格式路徑，例如 /mnt/c/Users/Foo/pipeline-orchestratorV3）
+# ── 參數：專案根目錄 + 可選 --rebuild 旗標
 PROJECT_DIR="${1:-}"
+REBUILD="no"
+for arg in "${@:2}"; do
+    case "$arg" in
+        --rebuild|-r) REBUILD="yes" ;;
+    esac
+done
 if [[ -z "$PROJECT_DIR" ]]; then
-    echo "用法：$0 <project_dir_in_wsl>"
+    echo "用法：$0 <project_dir_in_wsl> [--rebuild]"
     echo "範例：$0 /mnt/c/Users/GU605_PR_MZ/pipeline-orchestratorV3"
+    echo "改了 Dockerfile / requirements.txt 要重裝：$0 ... --rebuild"
     exit 1
 fi
 if [[ ! -d "$PROJECT_DIR" ]]; then
@@ -59,14 +71,23 @@ if ! sudo service docker status &>/dev/null; then
     sudo service docker start
 fi
 
-# ── 3. Build 沙盒映像檔（若尚未存在 or Dockerfile 有變動就 rebuild）
-if [[ "$($DOCKER images -q $IMAGE 2>/dev/null)" == "" ]]; then
-    echo "==> Build 沙盒映像檔 $IMAGE（首次約 3-5 分鐘，之後會 cache）..."
+# ── 3. Build 沙盒映像檔
+# --rebuild：強制砍掉舊 image + 舊 container，重裝（改 Dockerfile / requirements.txt 後用）
+# 沒 --rebuild：沒 image 才 build；有就跳過（fresh clone 會 build；重跑不浪費時間）
+if [[ "$REBUILD" == "yes" ]]; then
+    echo "==> 強制 rebuild（--rebuild）：先移除舊 container + image..."
+    $DOCKER rm -f "$CONTAINER" 2>/dev/null || true
+    $DOCKER rmi -f "$IMAGE" 2>/dev/null || true
+    echo "==> 重建映像檔 $IMAGE（約 5-10 分鐘，含 Node.js + 所有 pip 套件）..."
+    $DOCKER build --no-cache -t "$IMAGE" "$PROJECT_DIR/sandbox"
+    echo "✓ 映像檔已 rebuild"
+elif [[ "$($DOCKER images -q $IMAGE 2>/dev/null)" == "" ]]; then
+    echo "==> Build 沙盒映像檔 $IMAGE（首次約 5-10 分鐘）..."
     $DOCKER build -t "$IMAGE" "$PROJECT_DIR/sandbox"
     echo "✓ 映像檔已建立"
 else
     echo "✓ 映像檔已存在：$IMAGE"
-    echo "  （如果修改了 Dockerfile / requirements.txt，跑 '$DOCKER build -t $IMAGE $PROJECT_DIR/sandbox' 重建）"
+    echo "  （改了 Dockerfile / requirements.txt 要生效，加 --rebuild 重跑本腳本）"
 fi
 
 # ── 4. 啟動 / 重建容器
@@ -121,17 +142,38 @@ fi
 
 # ── 5. 冒煙測試
 echo ""
-echo "==> 冒煙測試："
-if $DOCKER exec "$CONTAINER" python -c "import pandas, openpyxl, numpy, requests; print('✓ 核心套件載入 OK')"; then
-    echo ""
-    echo "══════════════════════════════════════════════════════"
-    echo "✓ 沙盒就緒！"
-    echo "  容器名：$CONTAINER"
-    # 直接從容器 inspect 印出實際掛載，不依賴前面的本地變數
-    # （之前 refactor 改名後這行還引用舊變數 HOST_HOME_WSL 導致 set -u 報錯）
-    $DOCKER inspect "$CONTAINER" --format '{{range .Mounts}}    {{.Source}} → {{.Destination}}{{"\n"}}{{end}}' 2>/dev/null || true
-    echo "══════════════════════════════════════════════════════"
-else
-    echo "✗ 冒煙測試失敗，請檢查上面訊息"
+echo "==> 冒煙測試 — 核心套件："
+if ! $DOCKER exec "$CONTAINER" python -c "import pandas, openpyxl, numpy, requests; print('  ✓ Tier 1-2 OK')"; then
+    echo "✗ 核心套件測試失敗"
     exit 1
 fi
+
+echo "==> 冒煙測試 — 進階套件（Tier 4-5）："
+$DOCKER exec "$CONTAINER" python -c "
+missing = []
+for name in ['pptx', 'pdfplumber', 'newspaper', 'cloudscraper', 'feedparser']:
+    try:
+        __import__(name)
+    except Exception as e:
+        missing.append(f'{name} ({e.__class__.__name__})')
+if missing:
+    print('  ⚠ 缺少：', ', '.join(missing))
+    print('    解法：setup_sandbox.bat --rebuild 重建')
+else:
+    print('  ✓ python-pptx / pdfplumber / newspaper3k / cloudscraper / feedparser 全部 OK')
+" || true
+
+echo "==> 冒煙測試 — Node.js + pptxgenjs："
+if $DOCKER exec "$CONTAINER" bash -c 'node --version && npm list -g --depth=0 2>/dev/null | grep pptxgenjs' >/dev/null 2>&1; then
+    NODE_VER=$($DOCKER exec "$CONTAINER" node --version 2>/dev/null)
+    echo "  ✓ Node.js $NODE_VER + pptxgenjs OK"
+else
+    echo "  ⚠ Node.js 或 pptxgenjs 未安裝（解法：setup_sandbox.bat --rebuild）"
+fi
+
+echo ""
+echo "══════════════════════════════════════════════════════"
+echo "✓ 沙盒就緒！"
+echo "  容器名：$CONTAINER"
+$DOCKER inspect "$CONTAINER" --format '{{range .Mounts}}    {{.Source}} → {{.Destination}}{{"\n"}}{{end}}' 2>/dev/null || true
+echo "══════════════════════════════════════════════════════"
