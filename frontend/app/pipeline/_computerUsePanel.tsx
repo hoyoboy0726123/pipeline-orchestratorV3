@@ -582,7 +582,7 @@ export default function ComputerUsePanel({ node, pipelineName, onUpdate, onClose
           action={data.actions[editingAnchor]}
           actionIndex={editingAnchor}
           assetsDir={data.assetsDir || defaultAssetsDir}
-          defaultOcrRadius={data.cvSearchRadius || 400}
+          defaultSearchRadius={data.cvSearchRadius || 400}
           onApply={(patch) => applyAnchorPatch(editingAnchor, patch)}
           onClose={() => setEditingAnchor(null)}
         />

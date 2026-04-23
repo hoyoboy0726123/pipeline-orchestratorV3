@@ -476,6 +476,24 @@ class CropRequest(BaseModel):
     save_as: str            # 輸出檔名（例如 img_003_manual.png）
 
 
+@app.get("/computer-use/monitors")
+async def get_computer_use_monitors():
+    """列出實體螢幕的幾何（虛擬桌面絕對座標）。
+    前端錨點編輯器用這個做「只看單螢幕」的切換 — 多螢幕時整張 full_*.png 被 fit 到
+    viewport 會變很小，切單螢幕後畫面可以放大到看清楚。
+    回傳 monitors[0] 為虛擬桌面全景、monitors[1..N] 為每台實體螢幕。"""
+    try:
+        import mss as _mss
+        with _mss.mss() as sct:
+            monitors = [
+                {"left": m["left"], "top": m["top"], "width": m["width"], "height": m["height"]}
+                for m in sct.monitors
+            ]
+        return {"monitors": monitors}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"讀取 monitor 清單失敗：{e}")
+
+
 @app.post("/computer-use/assets/crop")
 async def crop_anchor_from_full(req: CropRequest):
     """從全螢幕截圖裁出新錨點。

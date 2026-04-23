@@ -1,15 +1,16 @@
 'use client'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { X, Check, RotateCcw } from 'lucide-react'
 import { toast } from 'sonner'
 import type { ComputerUseAction } from './_helpers'
-import { computerUseAssetImageUrl, cropAnchorFromFull } from '@/lib/api'
+import { computerUseAssetImageUrl, cropAnchorFromFull, getComputerUseMonitors, type MonitorRect } from '@/lib/api'
 
 interface Props {
   action: ComputerUseAction
   actionIndex: number
   assetsDir: string
-  defaultOcrRadius?: number  // 沒設定 ocr_box 時的預設半徑，一般是 step.cvSearchRadius
+  // step.cvSearchRadius — 同時當 CV 搜尋半徑視覺化的基準、以及 OCR 藍框的預設尺寸
+  defaultSearchRadius?: number
   onApply: (patch: Partial<ComputerUseAction>) => void
   onClose: () => void
 }
@@ -19,7 +20,8 @@ interface Props {
  * 顯示錄製當下的全螢幕截圖、點擊位置的紅十字、可拖曳的綠色裁切框。
  * 使用者按確認 → 呼叫後端裁出新錨點並更新 action。
  */
-export default function AnchorEditorModal({ action, actionIndex, assetsDir, defaultOcrRadius, onApply, onClose }: Props) {
+export default function AnchorEditorModal({ action, actionIndex, assetsDir, defaultSearchRadius, onApply, onClose }: Props) {
+  const searchRadius = Math.max(80, defaultSearchRadius ?? 400)
   // 目前僅支援有 full_image 的 action（新錄製才有）
   const fullImg = action.full_image || ''
   const fullLeft = action.full_left || 0
@@ -43,7 +45,7 @@ export default function AnchorEditorModal({ action, actionIndex, assetsDir, defa
   }))
 
   // 藍框：OCR 搜尋範圍（虛擬桌面絕對座標）
-  // 有存 ocr_box_* 就用存的；沒存就以點擊位置為中心、半徑用 defaultOcrRadius（預設 400）
+  // 有存 ocr_box_* 就用存的；沒存就以點擊位置為中心、半徑用 searchRadius（預設 400）
   const [ocrBox, setOcrBox] = useState(() => {
     const hasSaved = (action.ocr_box_width || 0) > 0 && (action.ocr_box_height || 0) > 0
     if (hasSaved) {
@@ -54,7 +56,7 @@ export default function AnchorEditorModal({ action, actionIndex, assetsDir, defa
         height: action.ocr_box_height || 0,
       }
     }
-    const r = Math.max(80, defaultOcrRadius ?? 400)
+    const r = searchRadius
     return {
       left: (action.x || 0) - r,
       top: (action.y || 0) - r,
@@ -92,6 +94,62 @@ export default function AnchorEditorModal({ action, actionIndex, assetsDir, defa
   const [displayScale, setDisplayScale] = useState(1)  // 縮放比（fit to viewport）
   const [preview, setPreview] = useState<string>('')
 
+  // 多螢幕切換：
+  //   monitors[0] = 虛擬桌面全景（mss 慣例），monitors[1..N] = 實體螢幕
+  //   viewMode='all' → 顯示整張 full 圖（舊行為）；viewMode=k → 只裁出該螢幕範圍
+  //   為什麼要切：6400×2160 虛擬桌面 fit 到 ~800px 視窗後元素變超小看不清
+  const [monitors, setMonitors] = useState<MonitorRect[]>([])
+  const [viewMode, setViewMode] = useState<'all' | number>('all')
+  useEffect(() => {
+    getComputerUseMonitors()
+      .then(r => setMonitors(r.monitors || []))
+      .catch(() => {/* 沒 monitors → 切換鈕不顯示，退回全圖模式 */})
+  }, [])
+  // 有 monitors 後，自動預設 viewMode 為「點擊所在的螢幕」省一次點擊
+  // （只在 mount 執行一次，之後使用者切就照使用者的選）
+  const _didAutoViewRef = useRef(false)
+  useEffect(() => {
+    if (_didAutoViewRef.current || monitors.length <= 2) return
+    const ax = action.x || 0
+    const ay = action.y || 0
+    for (let i = 1; i < monitors.length; i++) {
+      const m = monitors[i]
+      if (ax >= m.left && ax < m.left + m.width && ay >= m.top && ay < m.top + m.height) {
+        setViewMode(i)
+        _didAutoViewRef.current = true
+        return
+      }
+    }
+    _didAutoViewRef.current = true
+  }, [monitors, action.x, action.y])
+
+  // viewRect：目前可見區域（in full-image 相對座標，以 full_*.png 左上角為原點）
+  // 全部模式 = 整張圖；單螢幕模式 = 該螢幕在虛擬桌面上的矩形 − full_left/top，clamp 到圖內
+  const [imgW, imgW_set] = useState(0)
+  const [imgH, imgH_set] = useState(0)
+  const viewRect = useMemo(() => {
+    if (imgW === 0 || imgH === 0) return { x: 0, y: 0, w: imgW, h: imgH }
+    if (viewMode === 'all') return { x: 0, y: 0, w: imgW, h: imgH }
+    const mon = monitors[viewMode]
+    if (!mon) return { x: 0, y: 0, w: imgW, h: imgH }
+    const x = Math.max(0, mon.left - fullLeft)
+    const y = Math.max(0, mon.top - fullTop)
+    const w = Math.max(1, Math.min(imgW - x, mon.width))
+    const h = Math.max(1, Math.min(imgH - y, mon.height))
+    return { x, y, w, h }
+  }, [viewMode, monitors, fullLeft, fullTop, imgW, imgH])
+
+  // 世界座標（虛擬桌面絕對座標）⇄ Canvas CSS pixel 轉換
+  // 加上 viewRect 後所有繪圖要扣掉 viewRect 的位移
+  const worldToCanvas = (wx: number, wy: number) => ({
+    cx: (wx - fullLeft - viewRect.x) * displayScale,
+    cy: (wy - fullTop - viewRect.y) * displayScale,
+  })
+  const canvasToWorld = (cx: number, cy: number) => ({
+    x: cx / displayScale + fullLeft + viewRect.x,
+    y: cy / displayScale + fullTop + viewRect.y,
+  })
+
   // 拖曳狀態（新增 move-click 拖紅十字）
   const [dragMode, setDragMode] = useState<'none' | 'move' | 'resize-br' | 'resize-tl' | 'move-click'>('none')
   const dragRef = useRef({ startX: 0, startY: 0, boxLeft: 0, boxTop: 0, boxW: 0, boxH: 0, clickX: 0, clickY: 0 })
@@ -104,56 +162,69 @@ export default function AnchorEditorModal({ action, actionIndex, assetsDir, defa
     img.crossOrigin = 'anonymous'
     img.onload = () => {
       imgRef.current = img
+      imgW_set(img.width)
+      imgH_set(img.height)
       setImgLoaded(true)
     }
     img.onerror = () => toast.error('無法載入全螢幕截圖（full_*.png）')
     img.src = url
   }, [fullImg, assetsDir])
 
-  // 計算 fit-to-viewport 縮放（用左側容器實際尺寸）
+  // 計算 fit-to-viewport 縮放：fit 的是 viewRect（不是整張圖）
+  // 切到單螢幕 → viewRect 變小 → scale 變大 → 畫面放大到看得清楚
   useEffect(() => {
     if (!imgLoaded || !imgRef.current || !containerRef.current) return
-    const img = imgRef.current
     const cont = containerRef.current
     const recalc = () => {
-      const viewportW = cont.clientWidth - 40   // 預留 padding
+      const viewportW = cont.clientWidth - 40
       const viewportH = cont.clientHeight - 40
-      const scale = Math.min(viewportW / img.width, viewportH / img.height, 1)
-      setDisplayScale(scale)
+      const scale = Math.min(viewportW / viewRect.w, viewportH / viewRect.h, 1)
+      setDisplayScale(scale || 1)
     }
     recalc()
     const ro = new ResizeObserver(recalc)
     ro.observe(cont)
     return () => ro.disconnect()
-  }, [imgLoaded])
+  }, [imgLoaded, viewRect.w, viewRect.h])
 
   // 重繪 Canvas（HiDPI-safe）
   useEffect(() => {
     const canvas = canvasRef.current
     const img = imgRef.current
     if (!canvas || !img || !imgLoaded) return
-    // CSS 尺寸：fit-to-viewport 後使用者視覺上看到的大小
-    const dispW = img.width * displayScale
-    const dispH = img.height * displayScale
-    // 裝置像素比率（HiDPI 螢幕通常 2 或更高）
+    // CSS 尺寸 = viewRect fit 到 viewport 後的大小
+    const dispW = viewRect.w * displayScale
+    const dispH = viewRect.h * displayScale
     const dpr = Math.max(1, Math.min(4, window.devicePixelRatio || 1))
-    // Canvas 內部 pixel 數 = CSS 尺寸 × dpr（讓瀏覽器不用再放大、保持銳利）
     canvas.width = Math.round(dispW * dpr)
     canvas.height = Math.round(dispH * dpr)
-    // CSS 視覺尺寸保持 dispW × dispH
     canvas.style.width = `${dispW}px`
     canvas.style.height = `${dispH}px`
     const ctx = canvas.getContext('2d')!
-    // 之後的繪圖都在 CSS 座標系（ctx.scale 把筆直放大 dpr 倍到實際 pixel）
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-    // 啟用高品質縮放（預設 true 但明寫一下，避免某些瀏覽器關閉）
     ctx.imageSmoothingEnabled = true
     ctx.imageSmoothingQuality = 'high'
-    ctx.drawImage(img, 0, 0, dispW, dispH)
+    // drawImage 的 source 從 viewRect 取；destination 填整個 canvas
+    ctx.drawImage(img, viewRect.x, viewRect.y, viewRect.w, viewRect.h, 0, 0, dispW, dispH)
 
-    // 紅十字標點擊位置（full 圖座標 = absolute - full_left/top）
-    const cx = (clickPos.x - fullLeft) * displayScale
-    const cy = (clickPos.y - fullTop) * displayScale
+    // CV 模式：畫出搜尋範圍（錄製座標 ±cv_search_radius）讓使用者直觀看到
+    //   - 實線框 = CV 第一階段只在這裡找錨點
+    //   - 找不到會擴到全螢幕（cv_search_only_near=false 的預設情況下）
+    //   - 畫在錨點框「之前」，這樣錨點框疊在上層不會被遮
+    if (editMode === 'anchor') {
+      const { cx: rcx, cy: rcy } = worldToCanvas(clickPos.x, clickPos.y)
+      const rPx = searchRadius * displayScale
+      ctx.fillStyle = 'rgba(249, 115, 22, 0.08)'  // 很淡的橘色填充
+      ctx.fillRect(rcx - rPx, rcy - rPx, rPx * 2, rPx * 2)
+      ctx.strokeStyle = 'rgba(234, 88, 12, 0.7)'  // 橘線
+      ctx.lineWidth = 1.5
+      ctx.setLineDash([4, 3])
+      ctx.strokeRect(rcx - rPx, rcy - rPx, rPx * 2, rPx * 2)
+      ctx.setLineDash([])
+    }
+
+    // 紅十字標點擊位置（世界座標 → viewRect 下的 canvas 座標）
+    const { cx, cy } = worldToCanvas(clickPos.x, clickPos.y)
     // 外層白色描邊讓紅十字在各種背景下都看得清楚
     ctx.strokeStyle = 'white'
     ctx.lineWidth = 5
@@ -177,8 +248,7 @@ export default function AnchorEditorModal({ action, actionIndex, assetsDir, defa
     // 啟用中的框（綠框 = 錨點 / 藍框 = OCR 搜尋範圍）
     const activeBox = editMode === 'ocr' ? ocrBox : box
     const activeColor = editMode === 'ocr' ? '#3b82f6' : '#10b981'
-    const bx = (activeBox.left - fullLeft) * displayScale
-    const by = (activeBox.top - fullTop) * displayScale
+    const { cx: bx, cy: by } = worldToCanvas(activeBox.left, activeBox.top)
     const bw = activeBox.width * displayScale
     const bh = activeBox.height * displayScale
     // OCR 模式下畫半透明填色，讓「搜尋範圍」的視覺印象更直觀
@@ -196,21 +266,39 @@ export default function AnchorEditorModal({ action, actionIndex, assetsDir, defa
     const hs = 8
     ctx.fillRect(bx - hs / 2, by - hs / 2, hs, hs)                   // 左上
     ctx.fillRect(bx + bw - hs / 2, by + bh - hs / 2, hs, hs)         // 右下
-  }, [imgLoaded, displayScale, box, ocrBox, editMode, clickPos.x, clickPos.y, fullLeft, fullTop])
+  }, [imgLoaded, displayScale, box, ocrBox, editMode, clickPos.x, clickPos.y, fullLeft, fullTop, viewRect.x, viewRect.y, viewRect.w, viewRect.h, searchRadius])
 
-  // 更新右側預覽
+  // 更新右側預覽（錨點：原尺寸裁切；OCR：寬度壓到 ≤320px 節省記憶體，僅用於預覽）
+  const [ocrPreview, setOcrPreview] = useState<string>('')
   useEffect(() => {
     const img = imgRef.current
     if (!img || !imgLoaded) return
-    const pCanvas = document.createElement('canvas')
-    pCanvas.width = box.width
-    pCanvas.height = box.height
-    const ctx = pCanvas.getContext('2d')!
-    const sx = box.left - fullLeft
-    const sy = box.top - fullTop
-    ctx.drawImage(img, sx, sy, box.width, box.height, 0, 0, box.width, box.height)
-    setPreview(pCanvas.toDataURL('image/png'))
-  }, [imgLoaded, box, fullLeft, fullTop])
+    // 錨點預覽：原尺寸（用 pixelated 放大顯示能看清楚）
+    {
+      const pCanvas = document.createElement('canvas')
+      pCanvas.width = box.width
+      pCanvas.height = box.height
+      const ctx = pCanvas.getContext('2d')!
+      ctx.drawImage(img, box.left - fullLeft, box.top - fullTop, box.width, box.height, 0, 0, box.width, box.height)
+      setPreview(pCanvas.toDataURL('image/png'))
+    }
+    // OCR 預覽：藍框範圍可能很大（500×500 ~ 2000×2000），裁原尺寸會吃記憶體，縮到 ≤320px 寬
+    {
+      const W = Math.max(1, ocrBox.width)
+      const H = Math.max(1, ocrBox.height)
+      const scale = Math.min(320 / W, 200 / H, 1)
+      const pW = Math.max(1, Math.round(W * scale))
+      const pH = Math.max(1, Math.round(H * scale))
+      const pCanvas = document.createElement('canvas')
+      pCanvas.width = pW
+      pCanvas.height = pH
+      const ctx = pCanvas.getContext('2d')!
+      ctx.imageSmoothingEnabled = true
+      ctx.imageSmoothingQuality = 'high'
+      ctx.drawImage(img, ocrBox.left - fullLeft, ocrBox.top - fullTop, W, H, 0, 0, pW, pH)
+      setOcrPreview(pCanvas.toDataURL('image/jpeg', 0.85))
+    }
+  }, [imgLoaded, box, ocrBox, fullLeft, fullTop])
 
   // 計算 variance（簡單版：RGB 標準差）
   const [variance, setVariance] = useState(0)
@@ -235,24 +323,16 @@ export default function AnchorEditorModal({ action, actionIndex, assetsDir, defa
     setVariance(Math.round(v))
   }, [imgLoaded, box, fullLeft, fullTop])
 
-  // 滑鼠事件處理（Canvas 相對座標 → full 圖座標）
-  const canvasToFull = (cx: number, cy: number) => ({
-    x: cx / displayScale + fullLeft,
-    y: cy / displayScale + fullTop,
-  })
-
+  // 滑鼠事件處理（Canvas 相對座標 → 世界座標；已透過 worldToCanvas/canvasToWorld 考慮 viewRect）
   const onMouseDown = (e: React.MouseEvent) => {
     const rect = canvasRef.current!.getBoundingClientRect()
     const cx = e.clientX - rect.left
     const cy = e.clientY - rect.top
     // 紅十字優先判斷（在框內但靠近紅十字時優先拖紅十字）
-    const crossX = (clickPos.x - fullLeft) * displayScale
-    const crossY = (clickPos.y - fullTop) * displayScale
+    const { cx: crossX, cy: crossY } = worldToCanvas(clickPos.x, clickPos.y)
     const nearCross = Math.abs(cx - crossX) < 12 && Math.abs(cy - crossY) < 12
-    // 當前啟用的框（綠 / 藍）
     const activeBox = editMode === 'ocr' ? ocrBox : box
-    const bx = (activeBox.left - fullLeft) * displayScale
-    const by = (activeBox.top - fullTop) * displayScale
+    const { cx: bx, cy: by } = worldToCanvas(activeBox.left, activeBox.top)
     const bw = activeBox.width * displayScale
     const bh = activeBox.height * displayScale
     const nearTL = Math.abs(cx - bx) < 10 && Math.abs(cy - by) < 10
@@ -360,7 +440,7 @@ export default function AnchorEditorModal({ action, actionIndex, assetsDir, defa
   // 重置：依 mode 回到預設
   const handleReset = () => {
     if (editMode === 'ocr') {
-      const r = Math.max(80, defaultOcrRadius ?? 400)
+      const r = searchRadius
       setOcrBox({ left: clickPos.x - r, top: clickPos.y - r, width: r * 2, height: r * 2 })
     } else {
       setBox({ left: clickPos.x - 120, top: clickPos.y - 40, width: 240, height: 80 })
@@ -439,7 +519,7 @@ export default function AnchorEditorModal({ action, actionIndex, assetsDir, defa
                   ? 'bg-emerald-500 text-white font-semibold'
                   : 'bg-white text-gray-600 hover:bg-gray-50'
               }`}
-            >🟩 錨點範圍</button>
+            >🟩 CV 錨點</button>
             <button
               onClick={() => setEditMode('ocr')}
               className={`px-3 py-1.5 transition-colors ${
@@ -447,8 +527,38 @@ export default function AnchorEditorModal({ action, actionIndex, assetsDir, defa
                   ? 'bg-blue-500 text-white font-semibold'
                   : 'bg-white text-gray-600 hover:bg-gray-50'
               }`}
-            >🟦 OCR 搜尋範圍</button>
+            >🟦 OCR 範圍</button>
           </div>
+          {/* 多螢幕切換：只有兩張以上實體螢幕時顯示（monitors[1..N] 代表實體螢幕）*/}
+          {/* 切單螢幕後畫面放大好幾倍，小按鈕、文字都看得清楚 */}
+          {monitors.length > 2 && (
+            <div className="flex items-center gap-0 ml-2 border border-gray-200 rounded-lg overflow-hidden text-xs">
+              <button
+                onClick={() => setViewMode('all')}
+                className={`px-3 py-1.5 transition-colors ${
+                  viewMode === 'all'
+                    ? 'bg-gray-700 text-white font-semibold'
+                    : 'bg-white text-gray-600 hover:bg-gray-50'
+                }`}
+                title="顯示整個虛擬桌面"
+              >🖥️ 全部</button>
+              {monitors.slice(1).map((_m, i) => {
+                const idx = i + 1
+                return (
+                  <button
+                    key={idx}
+                    onClick={() => setViewMode(idx)}
+                    className={`px-3 py-1.5 transition-colors ${
+                      viewMode === idx
+                        ? 'bg-gray-700 text-white font-semibold'
+                        : 'bg-white text-gray-600 hover:bg-gray-50'
+                    }`}
+                    title={`${monitors[idx].width}×${monitors[idx].height} @ (${monitors[idx].left},${monitors[idx].top})`}
+                  >🖥️ {idx}</button>
+                )
+              })}
+            </div>
+          )}
           <div className="flex-1" />
           <button onClick={onClose} className="text-gray-400 hover:text-gray-600"><X className="w-4 h-4" /></button>
         </div>
@@ -472,11 +582,11 @@ export default function AnchorEditorModal({ action, actionIndex, assetsDir, defa
             {editMode === 'anchor' ? (
               <>
                 <div>
-                  <div className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">錨點預覽</div>
+                  <div className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">🟩 CV 錨點（綠框）</div>
                   {preview && (
                     <img src={preview} alt="anchor preview"
                       // pixelated：禁用瀏覽器內建 bilinear 平滑，pixel-level 清晰，
-                      // 對 240x80 這種小圖放大顯示時避免字邊模糊
+                      // 對 240×80 這種小圖放大顯示時避免字邊模糊
                       style={{ imageRendering: 'pixelated' }}
                       className="border border-gray-300 bg-checkered w-full" />
                   )}
@@ -495,27 +605,36 @@ export default function AnchorEditorModal({ action, actionIndex, assetsDir, defa
                   </div>
                 </div>
 
+                <div className="p-2 bg-gray-50 rounded-lg text-xs text-gray-600 leading-relaxed space-y-1.5">
+                  <div className="font-semibold text-gray-700">🔎 CV 比對運作流程</div>
+                  <div>1️⃣ <b>橘色虛線框</b>內（±{searchRadius}px）找綠框錨點</div>
+                  <div>2️⃣ 找不到 → 擴大到整個螢幕再找（除非勾了「只搜附近」）</div>
+                  <div>3️⃣ 全螢幕也找不到 → 依設定 FAIL 或退回紅十字座標硬點</div>
+                  <div>✅ 找到後，點擊位置 = 錨點中心 + 紅十字相對錨點的偏移</div>
+                </div>
+
                 <div className="p-2 bg-gray-50 rounded-lg text-xs text-gray-600 space-y-1">
-                  <div>🎯 紅色十字 = 點擊位置 <b className="text-red-600">（可拖曳調整）</b></div>
-                  <div>🟩 綠框 = 錨點範圍（拖中間移動、拖左上/右下角改大小）</div>
-                  <div className="text-gray-500 pt-1 border-t border-gray-200">
-                    座標：({clickPos.x}, {clickPos.y})
+                  <div>🎯 紅十字 = 點擊座標 <b className="text-red-600">（可拖曳調整）</b></div>
+                  <div>🟩 綠框 = 錨點樣板（拖中間移動、拖左上/右下角改大小）</div>
+                  <div>🟧 橘框 = CV 第一階段搜尋範圍</div>
+                  <div className="text-gray-500 pt-1 border-t border-gray-200 font-mono">
+                    點擊座標：({clickPos.x}, {clickPos.y})
                   </div>
                 </div>
                 <div className="p-2 bg-purple-50 border border-purple-200 rounded-lg text-xs text-purple-800 leading-relaxed">
-                  <strong>🔍 套用後會自動啟用圖像比對模式</strong><br/>
-                  執行時會用這個錨點在當前畫面找位置，UI 跑掉也能追著目標點。
-                  點擊位置 = 錨點被找到的位置 + 紅十字相對錨點的偏移。
+                  <strong>💡 小錨點 vs 大錨點</strong><br/>
+                  小 = 追會移動的元素（icon、選單項）；大 = 以周圍 UI 結構定位特徵稀少的目標（空白儲存格、對話框）。
                 </div>
               </>
             ) : (
               <>
                 <div>
-                  <div className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">OCR 搜尋範圍</div>
-                  <div className="text-xs text-gray-600 leading-relaxed">
-                    OCR 會只掃藍框內的文字。框越小速度越快、誤判越少；框越大覆蓋越廣但也越慢。
-                  </div>
-                  <div className="text-xs text-gray-500 mt-2 font-mono">
+                  <div className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">🟦 OCR 搜尋範圍（藍框）</div>
+                  {ocrPreview && (
+                    <img src={ocrPreview} alt="ocr range preview"
+                      className="border border-gray-300 w-full" />
+                  )}
+                  <div className="text-xs text-gray-500 mt-1 font-mono">
                     {ocrBox.width} × {ocrBox.height} px · 面積 {ocrArea.toLocaleString()} px²
                   </div>
                   <div className="text-[11px] text-gray-400 mt-0.5 font-mono">
@@ -527,17 +646,24 @@ export default function AnchorEditorModal({ action, actionIndex, assetsDir, defa
                   {ocrPerfNote.text}
                 </div>
 
+                <div className="p-2 bg-gray-50 rounded-lg text-xs text-gray-600 leading-relaxed space-y-1.5">
+                  <div className="font-semibold text-gray-700">🔤 OCR 運作流程</div>
+                  <div>1️⃣ 擷取藍框內的螢幕影像</div>
+                  <div>2️⃣ Windows OCR 讀出文字 → 比對 <code className="px-1 bg-white rounded font-mono">ocr_text</code></div>
+                  <div>3️⃣ 找到 → 點文字中心（<b>忽略紅十字座標</b>，適合位置會跑的目標）</div>
+                  <div>4️⃣ 找不到 → 依 ocr_cv_fallback 決定 FAIL 或退回 CV 錨點比對</div>
+                </div>
+
                 <div className="p-2 bg-gray-50 rounded-lg text-xs text-gray-600 space-y-1">
-                  <div>🎯 紅色十字 = 點擊位置 <b className="text-red-600">（可拖曳調整）</b></div>
-                  <div>🟦 藍框 = OCR 搜尋範圍（拖中間移動、拖左上/右下角改大小）</div>
-                  <div className="text-gray-500 pt-1 border-t border-gray-200">
+                  <div>🎯 紅十字 = 點擊座標 <span className="text-gray-400">(OCR 模式不使用)</span></div>
+                  <div>🟦 藍框 = OCR 掃描區域（拖中間移動、拖左上/右下角改大小）</div>
+                  <div className="text-gray-500 pt-1 border-t border-gray-200 font-mono">
                     點擊座標：({clickPos.x}, {clickPos.y})
                   </div>
                 </div>
                 <div className="p-2 bg-blue-50 border border-blue-200 rounded-lg text-xs text-blue-800 leading-relaxed">
-                  <strong>🔤 套用後會自動啟用 OCR 模式</strong><br/>
-                  執行時會在藍框裡搜尋 <code className="px-1 bg-white rounded">ocr_text</code> 設定的文字，找到就點文字中心。
-                  不影響圖像比對（若 OCR 失敗且有啟用 ocr_cv_fallback，才會退回綠框錨點）。
+                  <strong>💡 套用後會自動勾 use_ocr</strong><br/>
+                  記得在動作列也填好 <code className="px-1 bg-white rounded font-mono">ocr_text</code> 才算完整設定。
                 </div>
               </>
             )}
@@ -548,7 +674,7 @@ export default function AnchorEditorModal({ action, actionIndex, assetsDir, defa
               className="flex items-center justify-center gap-1.5 px-3 py-2 border border-gray-200 rounded-lg text-sm text-gray-600 hover:bg-gray-50">
               <RotateCcw className="w-3.5 h-3.5" />
               {editMode === 'ocr'
-                ? `重置（以點擊點為中心 ${(defaultOcrRadius ?? 400) * 2}×${(defaultOcrRadius ?? 400) * 2}）`
+                ? `重置（以點擊點為中心 ${searchRadius * 2}×${searchRadius * 2}）`
                 : '重置（以點擊點為中心 240×80）'}
             </button>
 

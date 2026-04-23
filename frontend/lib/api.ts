@@ -466,6 +466,23 @@ export function computerUseAssetImageUrl(dir: string, name: string): string {
   return `${BASE}/computer-use/assets/image?dir=${encodeURIComponent(dir)}&name=${encodeURIComponent(name)}`
 }
 
+export interface MonitorRect {
+  left: number
+  top: number
+  width: number
+  height: number
+}
+
+export async function getComputerUseMonitors(): Promise<{ monitors: MonitorRect[] }> {
+  // monitors[0] = 虛擬桌面全景；monitors[1..N] = 每台實體螢幕
+  const res = await fetch(`${BASE}/computer-use/monitors`)
+  if (!res.ok) {
+    const detail = await res.text().catch(() => '')
+    throw new Error(detail || `讀取 monitor 清單失敗 (${res.status})`)
+  }
+  return res.json()
+}
+
 export interface CropAnchorReq {
   dir: string
   full_image: string
