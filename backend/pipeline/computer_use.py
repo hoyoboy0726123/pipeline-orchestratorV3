@@ -688,6 +688,78 @@ def execute_action(
             mods_tag = f"[{'+'.join(modifiers)}] " if modifiers else ""
             msg = f"{mods_tag}在 ({x},{y}) 捲動 dy={dy}"
 
+        elif atype == "activate_window":
+            # 將指定標題的視窗帶到前景。解決錄製回放最常見的失敗原因：
+            # 目標視窗在背景 → 點擊被其他視窗截去 or hover 作用在錯的視窗。
+            # Linux 下 pygetwindow 支援很薄，用 try/except 吞例外並回 FAIL 讓使用者知情。
+            title = (action.get("title") or "").strip()
+            title_contains = (action.get("title_contains") or "").strip()
+            if not title and not title_contains:
+                return ActionResult(False, index, atype,
+                    "activate_window 缺 title 或 title_contains 欄位")
+            timeout = float(action.get("timeout_sec", 3.0))
+            try:
+                import pygetwindow as gw
+            except Exception as e:
+                return ActionResult(False, index, atype,
+                    f"pygetwindow 無法載入（此平台可能不支援）：{e}")
+
+            def _find_win():
+                try:
+                    all_wins = gw.getAllWindows()
+                except Exception:
+                    return []
+                if title:
+                    wins = [w for w in all_wins if (w.title or "") == title]
+                else:
+                    needle = title_contains.lower()
+                    wins = [w for w in all_wins if needle in (w.title or "").lower()]
+                return [w for w in wins if (w.title or "").strip()]
+
+            deadline = time.time() + timeout
+            target = None
+            while True:
+                _check_abort(run_id)
+                matched = _find_win()
+                if matched:
+                    target = matched[0]
+                    break
+                if time.time() >= deadline:
+                    break
+                time.sleep(0.2)
+
+            if target is None:
+                needle = title or title_contains
+                return ActionResult(False, index, atype,
+                    f"{timeout}s 內找不到視窗標題 ~= '{needle}'")
+
+            activated = False
+            try:
+                # 最小化的視窗必須先 restore 才能被 activate（pygetwindow 已實作這邏輯但不保證）
+                if getattr(target, "isMinimized", False):
+                    try:
+                        target.restore()
+                    except Exception:
+                        pass
+                target.activate()
+                activated = True
+            except Exception as _gw_err:
+                # pygetwindow 在 foreground lock 等情境會拋 PyGetWindowException；改用 Win32 直接搶焦點
+                try:
+                    import ctypes  # type: ignore
+                    hwnd = getattr(target, "_hWnd", None)
+                    if hwnd:
+                        ctypes.windll.user32.SetForegroundWindow(hwnd)
+                        activated = True
+                except Exception:
+                    pass
+                if not activated:
+                    return ActionResult(False, index, atype,
+                        f"找到視窗 '{target.title[:60]}' 但無法 activate：{_gw_err}")
+            # 給 Window Manager 時間切換焦點，避免下個動作時視窗還沒完全在前
+            time.sleep(0.25)
+            msg = f"已將視窗 '{(target.title or '')[:60]}' 切到前景"
+
         elif atype == "assert_image":
             # 驗證某張錨點圖「當下」必須可見（和 wait_image 相似但語意不同：
             # wait_image 等畫面載入、timeout 較長；assert_image 檢查當前狀態、timeout 較短）。

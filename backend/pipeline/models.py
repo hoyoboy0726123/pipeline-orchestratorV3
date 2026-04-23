@@ -52,8 +52,9 @@ class ComputerUseAction(BaseModel):
       - drag / scroll：拖曳 / 捲動
       - assert_image：驗證某錨點圖「當下」必須可見，否則步驟失敗（短 timeout）
       - assert_text：OCR 驗證螢幕上必須有某段文字，否則步驟失敗
+      - activate_window：把指定標題的視窗切到前景（解決錄製回放時視窗不在前的常見問題）
     """
-    type: str  # click_image | click_at | type_text | hotkey | wait | wait_image | screenshot | scroll | drag | assert_image | assert_text
+    type: str  # click_image | click_at | type_text | hotkey | wait | wait_image | screenshot | scroll | drag | assert_image | assert_text | activate_window
     image: str = ""       # 主錨點圖檔名（相對 assets_dir）
     image2: str = ""      # 次錨點圖檔名（多錨點驗證用，選填）
     dx2: int = 0          # 次錨點相對點擊點的位移 x
@@ -89,6 +90,9 @@ class ComputerUseAction(BaseModel):
     ocr_box_top: int = 0
     ocr_box_width: int = 0
     ocr_box_height: int = 0
+    # activate_window 專用：至少要填 title 或 title_contains 其一
+    title: str = ""              # 精確視窗標題比對
+    title_contains: str = ""     # 視窗標題子字串比對（大小寫不敏感）
 
 
 class PipelineStep(BaseModel):
