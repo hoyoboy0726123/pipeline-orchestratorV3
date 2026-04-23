@@ -23,7 +23,7 @@ Pipeline YAML 設定模型。
 """
 from typing import Optional
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class StepOutput(BaseModel):
@@ -54,8 +54,13 @@ class ComputerUseAction(BaseModel):
       - assert_text：OCR 驗證螢幕上必須有某段文字，否則步驟失敗
       - activate_window：把指定標題的視窗切到前景（解決錄製回放時視窗不在前的常見問題）
       - vlm_action：用自然語言描述目標 + VLM 視覺大模型決定要做什麼 primitive，不需錨點圖
+      - if_image_found：條件分支 — 找到 image 就跑 then: 動作清單，否則跑 else:
+      - retry_until：重複跑 do: 清單直到 until: 動作成功（處理按鈕要按多次、網路抖動等）
     """
-    type: str  # click_image | click_at | type_text | hotkey | wait | wait_image | screenshot | scroll | drag | assert_image | assert_text | activate_window | vlm_action
+    # YAML 會用 else: 這個 Python 保留字當 key，靠 pydantic alias 接回 Python 端的 else_
+    model_config = ConfigDict(populate_by_name=True)
+
+    type: str  # click_image | click_at | type_text | hotkey | wait | wait_image | screenshot | scroll | drag | assert_image | assert_text | activate_window | vlm_action | if_image_found | retry_until
     image: str = ""       # 主錨點圖檔名（相對 assets_dir）
     image2: str = ""      # 次錨點圖檔名（多錨點驗證用，選填）
     dx2: int = 0          # 次錨點相對點擊點的位移 x
@@ -106,6 +111,16 @@ class ComputerUseAction(BaseModel):
     vlm_prompt: str = ""          # 可選額外自然語言描述（"紅色送出鈕，不是藍色取消"）
     vlm_cv_fallback: bool = False  # VLM 失敗時是否退回 CV 鏈（類比 ocr_cv_fallback）
     vlm_model: str = ""           # 可選 override：本動作使用的 VLM 模型名稱（留空 = 用 settings）
+    # ── 控制流巢狀動作（if_image_found / retry_until 用）─────────
+    # 這些欄位刻意保留為 list[dict] / Optional[dict]，不做遞迴 pydantic 模型驗證，
+    # 因為 execute_action 接收的是 dict；巢狀動作在執行時才逐一 .get() 讀取並驗證。
+    # 優點：避免 pydantic 自我遞迴引用的 model_rebuild 麻煩；YAML 原始結構直通。
+    then: list[dict] = []                       # if_image_found：找到時跑的子動作清單
+    else_: list[dict] = Field(default_factory=list, alias="else")  # 找不到時跑的子動作清單
+    do: list[dict] = []                          # retry_until：要反覆執行的動作清單
+    until: Optional[dict] = None                 # retry_until：檢查條件（wait_image / assert_image / assert_text 之一）
+    max_attempts: int = 3                        # retry_until：最多試幾輪
+    wait_between_sec: float = 1.0                # retry_until：每輪之間等待秒數
 
 
 class PipelineStep(BaseModel):

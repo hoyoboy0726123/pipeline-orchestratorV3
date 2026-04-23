@@ -811,7 +811,9 @@ async def run_pipeline(
                 else:
                     assets_abs = str(_resolve_path(f"ai_output/{config.name}/{step.name}_assets"))
                 # actions 是 ComputerUseAction pydantic model，轉成 dict list 傳進引擎
-                actions_dicts = [a.model_dump() if hasattr(a, "model_dump") else dict(a) for a in (step.actions or [])]
+                # by_alias=True 確保 else_ 這類為了閃 Python 保留字取的別名，
+                # 在轉 dict 時還原為 YAML 原生的 "else" key（讓 execute_action 用 .get("else") 讀得到）
+                actions_dicts = [a.model_dump(by_alias=True) if hasattr(a, "model_dump") else dict(a) for a in (step.actions or [])]
                 _cu_result = await asyncio.get_event_loop().run_in_executor(
                     None,
                     lambda: execute_computer_use_step(
