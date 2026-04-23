@@ -757,7 +757,10 @@ export async function setSandboxMode(mode: 'host' | 'wsl_docker'): Promise<Sandb
   return res.json()
 }
 
-export async function pipelineChat(messages: Array<{ role: 'user' | 'assistant'; content: string }>): Promise<{
+export async function pipelineChat(
+  messages: Array<{ role: 'user' | 'assistant'; content: string }>,
+  workflowId?: string | null,
+): Promise<{
   reply: string
   has_yaml: boolean
   yaml_content: string | null
@@ -766,14 +769,70 @@ export async function pipelineChat(messages: Array<{ role: 'user' | 'assistant';
   // 使用 DIRECT_BASE 繞過 Next.js dev rewrite proxy 的 ~30s socket timeout
   // （LLM 回應經常 30-60s；走 proxy 會被截斷回 500）
   // 不用 fetchWithRetry：觸發 LLM 有金流/速率成本，失敗讓使用者手動重送
+  const body: Record<string, unknown> = { messages }
+  if (workflowId) body.workflow_id = workflowId
   const res = await fetch(`${DIRECT_BASE}/pipeline/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ messages }),
+    body: JSON.stringify(body),
   })
   if (!res.ok) {
     const detail = await res.text().catch(() => '')
     throw new Error(detail ? `AI 回應失敗 (${res.status}): ${detail.slice(0, 200)}` : 'AI 回應失敗（請確認後端 uvicorn 在執行）')
   }
   return res.json()
+}
+
+// ── Per-workflow chat history ────────────────────────────────────────────────
+// 每個工作流保留獨立的 AI 助手對話紀錄，使用者日後可以接續討論加功能
+// （未綁工作流的 scratch 對話由前端用 localStorage 暫存，不走這裡）
+
+export interface WorkflowChatMessage {
+  role: 'user' | 'assistant'
+  content: string
+  ts?: number
+}
+
+export async function getWorkflowChat(workflowId: string): Promise<WorkflowChatMessage[]> {
+  const res = await fetchWithRetry(`${BASE}/workflows/${workflowId}/chat`)
+  if (!res.ok) throw new Error('讀取工作流對話失敗')
+  const data = await res.json()
+  return data.messages || []
+}
+
+export async function appendWorkflowChat(
+  workflowId: string,
+  role: 'user' | 'assistant',
+  content: string,
+): Promise<WorkflowChatMessage[]> {
+  const res = await fetchWithRetry(`${BASE}/workflows/${workflowId}/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ role, content }),
+  })
+  if (!res.ok) throw new Error('追加對話訊息失敗')
+  const data = await res.json()
+  return data.messages || []
+}
+
+export async function setWorkflowChat(
+  workflowId: string,
+  messages: Array<{ role: 'user' | 'assistant'; content: string }>,
+): Promise<WorkflowChatMessage[]> {
+  // 覆寫整份（用於把 localStorage scratch 一次灌進新建立的工作流）
+  const res = await fetchWithRetry(`${BASE}/workflows/${workflowId}/chat`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ messages }),
+  })
+  if (!res.ok) throw new Error('覆寫對話訊息失敗')
+  const data = await res.json()
+  return data.messages || []
+}
+
+export async function clearWorkflowChat(workflowId: string): Promise<void> {
+  const res = await fetchWithRetry(`${BASE}/workflows/${workflowId}/chat`, {
+    method: 'DELETE',
+  })
+  if (!res.ok) throw new Error('清空對話失敗')
 }

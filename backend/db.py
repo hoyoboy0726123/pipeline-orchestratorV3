@@ -74,6 +74,9 @@ def init_db():
     _migrate_old_recipes(conn)
     # 欄位遷移：舊版 recipes 表缺 was_interactive 欄位
     _add_column_if_missing(conn, "recipes", "was_interactive", "INTEGER NOT NULL DEFAULT 0")
+    # 欄位遷移：workflows 表新增 chat_messages 欄位（每工作流一條 AI 助手對話）
+    # 儲存 JSON 陣列 [{role: 'user'|'assistant', content: str, ts: float}, ...]
+    _add_column_if_missing(conn, "workflows", "chat_messages", "TEXT NOT NULL DEFAULT '[]'")
 
 
 def _add_column_if_missing(conn: sqlite3.Connection, table: str, col: str, col_def: str):
@@ -251,6 +254,66 @@ def _row_to_workflow(row) -> dict:
         "created_at": row[5],
         "updated_at": row[6],
     }
+
+
+# ── Chat CRUD（per-workflow AI 助手對話歷史）────────────────────────────────
+# 儲存格式：JSON 陣列；每則訊息 {role: 'user'|'assistant', content: str, ts: float}
+# 不更新 workflows.updated_at（聊天不是「真正的工作流改動」，避免推擠排序）
+
+def get_workflow_chat(wf_id: str) -> Optional[list]:
+    """回傳指定工作流的對話訊息陣列；workflow 不存在回 None。"""
+    conn = get_conn()
+    row = conn.execute("SELECT chat_messages FROM workflows WHERE id=?", (wf_id,)).fetchone()
+    if not row:
+        return None
+    try:
+        return json.loads(row[0] or "[]")
+    except Exception:
+        return []
+
+
+def set_workflow_chat(wf_id: str, messages: list) -> bool:
+    """整批寫入對話歷史（取代既有）。workflow 不存在回 False。"""
+    conn = get_conn()
+    existing = conn.execute("SELECT 1 FROM workflows WHERE id=?", (wf_id,)).fetchone()
+    if not existing:
+        return False
+    # 基本 schema 檢查：每筆要有 role + content
+    clean = []
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        content = m.get("content")
+        if role not in ("user", "assistant") or not isinstance(content, str):
+            continue
+        entry = {"role": role, "content": content}
+        if "ts" in m and isinstance(m["ts"], (int, float)):
+            entry["ts"] = m["ts"]
+        clean.append(entry)
+    conn.execute(
+        "UPDATE workflows SET chat_messages=? WHERE id=?",
+        (json.dumps(clean, ensure_ascii=False), wf_id),
+    )
+    conn.commit()
+    return True
+
+
+def append_workflow_chat(wf_id: str, role: str, content: str) -> Optional[list]:
+    """在尾端追加一則訊息。回傳新的完整訊息陣列；workflow 不存在回 None。"""
+    if role not in ("user", "assistant"):
+        return None
+    msgs = get_workflow_chat(wf_id)
+    if msgs is None:
+        return None
+    msgs.append({"role": role, "content": content, "ts": time.time()})
+    set_workflow_chat(wf_id, msgs)
+    return msgs
+
+
+def clear_workflow_chat(wf_id: str) -> bool:
+    """清空對話歷史（使用者按「新話題」）。"""
+    return set_workflow_chat(wf_id, [])
 
 
 # ── Recipe CRUD（改為 workflow_id 關聯）───────────────────────────────────────

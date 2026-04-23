@@ -1415,6 +1415,60 @@ def _build_pipeline_system_prompt() -> str:
 
 class PipelineChatRequest(BaseModel):
     messages: list[dict]
+    workflow_id: Optional[str] = None  # 若帶，會把該工作流當前 canvas/YAML 注入 system prompt，
+                                       # 讓 AI 能理解「在現有工作流加步驟」的增量需求
+
+
+# 送 LLM 前保留最近多少則訊息（避免對話太長 token 爆炸 / 花錢）
+# 設 30 大致能容納「規劃 → 修改 → 再修改」幾輪；早期概念性討論遺忘可接受
+_CHAT_HISTORY_CAP = 30
+
+
+def _workflow_state_block(workflow_id: str) -> str:
+    """把當前工作流的 canvas 步驟摘要 + YAML 全文拼成一段注入 system prompt。
+    這段告訴 LLM「使用者現在看到的工作流長這樣」，支援增量修改需求
+    （例：「再加一個人工確認節點」需要知道現有幾步、叫什麼）。
+    找不到 workflow 就回空字串，fallback 到原本的「從零規劃」行為。
+    """
+    try:
+        import db
+        wf = db.get_workflow(workflow_id)
+        if not wf:
+            return ""
+        canvas = wf.get("canvas") or {}
+        nodes = canvas.get("nodes") or []
+        lines = [
+            "",
+            "## 使用者目前正在編輯的工作流",
+            f"名稱：{wf.get('name', '未命名')}（id={workflow_id}）",
+            f"節點數：{len(nodes)}",
+        ]
+        if nodes:
+            lines.append("目前節點摘要（依畫布順序）：")
+            for i, n in enumerate(nodes[:20], start=1):
+                ntype = n.get("type") or "?"
+                data = n.get("data") or {}
+                name = data.get("name") or data.get("label") or "(未命名)"
+                lines.append(f"  {i}. [{ntype}] {name}")
+            if len(nodes) > 20:
+                lines.append(f"  ... 另有 {len(nodes) - 20} 個節點未列")
+        yaml_text = (wf.get("yaml") or "").strip()
+        if yaml_text:
+            # 避免 YAML 過長塞爆 prompt；超過 3000 字就截斷（頭尾各留一半）
+            if len(yaml_text) > 3000:
+                yaml_text = yaml_text[:1500] + "\n# ...（中段省略）...\n" + yaml_text[-1500:]
+            lines.append("")
+            lines.append("完整 YAML：")
+            lines.append("```yaml")
+            lines.append(yaml_text)
+            lines.append("```")
+        lines.append("")
+        lines.append("**若使用者要求是修改 / 增量調整**（如「再加一步」、「把第 2 步改成…」），"
+                     "在既有基礎上改動後回覆完整新 YAML；不是打掉重練。")
+        lines.append("**若使用者要求跟現有工作流無關**（另開新題目），照常從零規劃即可。")
+        return "\n".join(lines)
+    except Exception:
+        return ""
 
 
 @app.post("/pipeline/chat")
@@ -1424,8 +1478,14 @@ async def pipeline_chat(req: PipelineChatRequest):
     import re
 
     llm = build_llm(temperature=0.3)
-    lc_messages = [SystemMessage(content=_build_pipeline_system_prompt())]
-    for m in req.messages:
+    system_prompt = _build_pipeline_system_prompt()
+    if req.workflow_id:
+        system_prompt += _workflow_state_block(req.workflow_id)
+    lc_messages = [SystemMessage(content=system_prompt)]
+    # 只取最近 _CHAT_HISTORY_CAP 則訊息送進 LLM，避免對話太長 token 爆炸
+    # （訊息仍全部保存在 DB，只是不全部餵給模型）
+    recent = req.messages[-_CHAT_HISTORY_CAP:] if len(req.messages) > _CHAT_HISTORY_CAP else req.messages
+    for m in recent:
         cls = HumanMessage if m["role"] == "user" else AIMessage
         lc_messages.append(cls(content=m["content"]))
 
@@ -1461,6 +1521,63 @@ async def pipeline_chat(req: PipelineChatRequest):
                 yaml_error = f"YAML 語法/結構錯誤：{type(e).__name__}：{str(e)[:300]}"
 
     return {"reply": content, "has_yaml": has_yaml, "yaml_content": yaml_content, "yaml_error": yaml_error}
+
+
+# ── Workflow Chat History（per-workflow AI 助手對話紀錄）─────────────────────
+# 用途：每個工作流保留自己的對話歷史，使用者回來還能接續跟 AI 討論加功能
+# 儲存在 workflows.chat_messages TEXT 欄位（JSON 陣列），更新不動 updated_at
+# （聊天不代表工作流本體有變動，不想擾亂工作流列表的排序）
+
+class ChatMessageIn(BaseModel):
+    role: str   # 'user' 或 'assistant'
+    content: str
+
+
+class ChatBulkSetRequest(BaseModel):
+    messages: list[ChatMessageIn]
+
+
+@app.get("/workflows/{workflow_id}/chat")
+async def get_workflow_chat_api(workflow_id: str):
+    """載入指定工作流的對話歷史。"""
+    import db
+    msgs = db.get_workflow_chat(workflow_id)
+    if msgs is None:
+        raise HTTPException(status_code=404, detail=f"找不到工作流：{workflow_id}")
+    return {"messages": msgs}
+
+
+@app.post("/workflows/{workflow_id}/chat")
+async def append_workflow_chat_api(workflow_id: str, msg: ChatMessageIn):
+    """追加一則訊息（user 或 assistant）。回傳更新後的完整訊息陣列。"""
+    import db
+    if msg.role not in ("user", "assistant"):
+        raise HTTPException(status_code=400, detail="role 必須是 'user' 或 'assistant'")
+    result = db.append_workflow_chat(workflow_id, msg.role, msg.content)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"找不到工作流：{workflow_id}")
+    return {"messages": result}
+
+
+@app.put("/workflows/{workflow_id}/chat")
+async def set_workflow_chat_api(workflow_id: str, req: ChatBulkSetRequest):
+    """一次性整批覆寫訊息（用於 scratch chat 遷移到新建立的工作流）。"""
+    import db
+    msgs = [{"role": m.role, "content": m.content} for m in req.messages]
+    ok = db.set_workflow_chat(workflow_id, msgs)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"找不到工作流：{workflow_id}")
+    return {"messages": db.get_workflow_chat(workflow_id)}
+
+
+@app.delete("/workflows/{workflow_id}/chat")
+async def clear_workflow_chat_api(workflow_id: str):
+    """清空對話歷史（使用者按「🗑️ 新話題」）。"""
+    import db
+    ok = db.clear_workflow_chat(workflow_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"找不到工作流：{workflow_id}")
+    return {"messages": []}
 
 
 # ── Helpers ──────────────────────────────────────────────────

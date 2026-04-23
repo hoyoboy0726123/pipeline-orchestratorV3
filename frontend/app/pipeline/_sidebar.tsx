@@ -13,6 +13,7 @@ import {
   pipelineChat, createWorkflowApi, exportWorkflowUrl, importWorkflow,
   getPipelineScheduled, getPipelineRuns, cancelPipelineSchedule,
   getEnvPaths, type EnvPaths,
+  getWorkflowChat, appendWorkflowChat, clearWorkflowChat,
 } from '@/lib/api'
 import type { ScheduledTask } from '@/lib/types'
 
@@ -302,16 +303,51 @@ export default function Sidebar({ onYamlApply }: SidebarProps) {
     { role: 'assistant', content: '你好！請告訴我你想自動化的工作流程，我會幫你產生 Pipeline YAML 設定。\n\n（正在載入專案路徑資訊…）' }
   ])
 
-  // 載入專案實際路徑，把初始訊息中的路徑替換成真實可用的版本
+  // 環境路徑（用來動態組 welcome message）— 跨多個 effect 共用
+  const [envPaths, setEnvPaths] = useState<EnvPaths | null>(null)
   useEffect(() => {
-    getEnvPaths().then(env => {
-      setMessages(prev => {
-        // 只替換初始那一條（仍是預設內容時）；使用者已有對話就不覆蓋
-        if (prev.length !== 1 || prev[0].role !== 'assistant') return prev
-        return [{ role: 'assistant', content: buildWelcomeMessage(env) }]
-      })
-    }).catch(() => {/* ignore — 沿用預設訊息 */})
+    getEnvPaths().then(setEnvPaths).catch(() => {/* ignore — 沿用預設訊息 */})
   }, [])
+
+  // 對話歷史持久化：
+  //   有 activeId（選了工作流）→ 後端 per-workflow chat
+  //   沒 activeId（剛開 app）→ localStorage scratch 暫存
+  // 切換 activeId 時重新載入對應的歷史；welcome 訊息只在歷史空時顯示
+  const SCRATCH_LS_KEY = 'pipeline-ai-chat-scratch-v1'
+  // 防止 initial load 把自己又 persist 回去（會造成無限循環 / 覆蓋 race）
+  const loadingRef = useRef(false)
+
+  useEffect(() => {
+    loadingRef.current = true
+    const loadWelcome = (): ChatMsg => ({
+      role: 'assistant',
+      content: envPaths ? buildWelcomeMessage(envPaths)
+        : '你好！請告訴我你想自動化的工作流程，我會幫你產生 Pipeline YAML 設定。',
+    })
+    const applyLoaded = (loaded: ChatMsg[]) => {
+      setMessages(loaded.length > 0 ? loaded : [loadWelcome()])
+      // 讓 React render 完再釋放 loading flag，避免緊接著的 setMessages 被誤判為使用者輸入
+      setTimeout(() => { loadingRef.current = false }, 0)
+    }
+    if (activeId) {
+      getWorkflowChat(activeId)
+        .then(msgs => applyLoaded(msgs as ChatMsg[]))
+        .catch(() => applyLoaded([]))
+    } else {
+      try {
+        const raw = localStorage.getItem(SCRATCH_LS_KEY)
+        const parsed = raw ? JSON.parse(raw) : []
+        applyLoaded(Array.isArray(parsed) ? parsed : [])
+      } catch {
+        applyLoaded([])
+      }
+    }
+  }, [activeId, envPaths])
+
+  // 輔助：判斷目前顯示的是「歡迎訊息」單條還是使用者真的有對話
+  // welcome 不該被寫進 DB 或 localStorage，避免每次載入都把 welcome 當歷史又寫回
+  const isWelcomeOnly = (msgs: ChatMsg[]) =>
+    msgs.length === 1 && msgs[0].role === 'assistant' && !msgs[0].hasYaml
   const [input, setInput]     = useState('')
   const [loading, setLoading] = useState(false)
   const chatEndRef = useRef<HTMLDivElement>(null)
@@ -467,24 +503,28 @@ export default function Sidebar({ onYamlApply }: SidebarProps) {
     const text = input.trim()
     if (!text || loading) return
     const userMsg: ChatMsg = { role: 'user', content: text }
-    const newMsgs = [...messages, userMsg]
+    // 若當前只有 welcome 訊息，送出使用者訊息時把 welcome 丟掉（不存進歷史）
+    const baseMsgs = isWelcomeOnly(messages) ? [] : messages
+    const newMsgs = [...baseMsgs, userMsg]
     setMessages(newMsgs)
     setInput('')
     setLoading(true)
+    // 先把 user 訊息落地：有 activeId → backend append；沒有 → localStorage
+    persistAppend(userMsg).catch(() => {/* 落地失敗不擋 UI */})
     try {
       const res = await pipelineChat(
-        newMsgs.map(m => ({ role: m.role, content: m.content }))
+        newMsgs.map(m => ({ role: m.role, content: m.content })),
+        activeId ?? undefined,
       )
-      setMessages(prev => [
-        ...prev,
-        {
-          role: 'assistant',
-          content: res.reply,
-          hasYaml: res.has_yaml,
-          yaml: res.yaml_content,
-          yamlError: res.yaml_error ?? null,
-        },
-      ])
+      const assistantMsg: ChatMsg = {
+        role: 'assistant',
+        content: res.reply,
+        hasYaml: res.has_yaml,
+        yaml: res.yaml_content,
+        yamlError: res.yaml_error ?? null,
+      }
+      setMessages(prev => [...prev, assistantMsg])
+      persistAppend(assistantMsg).catch(() => {/* 同上 */})
       if (res.yaml_error) {
         toast.error(`產生的 YAML 有語法問題：${res.yaml_error.slice(0, 120)}`)
       }
@@ -492,6 +532,47 @@ export default function Sidebar({ onYamlApply }: SidebarProps) {
       toast.error('AI 回應失敗')
     } finally {
       setLoading(false)
+    }
+  }
+
+  // 將一則訊息寫入持久層（backend 或 localStorage）
+  const persistAppend = async (msg: ChatMsg) => {
+    if (loadingRef.current) return  // 初次載入中不 persist 避免 race
+    if (activeId) {
+      try {
+        await appendWorkflowChat(activeId, msg.role, msg.content)
+      } catch {/* ignore — 下次進來 DB 讀不到最新一則，但不影響目前 UI */}
+    } else {
+      // scratch 模式：整個 messages 陣列寫 localStorage（最簡單、讀 side 也統一）
+      try {
+        // 用 setTimeout 0 確保拿到最新的 setMessages 後的 state
+        setTimeout(() => {
+          setMessages(curr => {
+            try {
+              const toSave = curr.filter(m => !m.yamlError)  // 不把 error marker 存進去
+              localStorage.setItem(SCRATCH_LS_KEY, JSON.stringify(toSave))
+            } catch {/* quota */}
+            return curr
+          })
+        }, 0)
+      } catch {/* ignore */}
+    }
+  }
+
+  // 清空對話 → 退回到只有 welcome 的狀態
+  const handleClearChat = async () => {
+    if (loading) return
+    if (!confirm('清空目前這條工作流的對話紀錄？（只影響對話，不影響畫布與 YAML）')) return
+    const welcome: ChatMsg = {
+      role: 'assistant',
+      content: envPaths ? buildWelcomeMessage(envPaths)
+        : '你好！請告訴我你想自動化的工作流程，我會幫你產生 Pipeline YAML 設定。',
+    }
+    setMessages([welcome])
+    if (activeId) {
+      try { await clearWorkflowChat(activeId) } catch { toast.error('清空失敗') }
+    } else {
+      try { localStorage.removeItem(SCRATCH_LS_KEY) } catch {/* ignore */}
     }
   }
 
@@ -651,6 +732,24 @@ export default function Sidebar({ onYamlApply }: SidebarProps) {
         {/* Chat panel */}
         {showChat && (
           <div className="flex flex-col flex-1 min-h-0 border-t border-gray-100">
+            {/* Sub-toolbar：顯示目前綁定的工作流 + 新話題按鈕 */}
+            <div className="flex items-center justify-between px-2.5 py-1.5 bg-gray-50/50 border-b border-gray-100 text-[11px] text-gray-500">
+              <span className="truncate">
+                {activeId ? (
+                  <>💾 對話綁定工作流：<span className="text-gray-700 font-medium">{workflows.find(w => w.id === activeId)?.name || activeId}</span></>
+                ) : (
+                  <>📝 暫存模式（未選工作流；建立 / 選取後才會持久保存）</>
+                )}
+              </span>
+              <button
+                onClick={handleClearChat}
+                disabled={loading || isWelcomeOnly(messages)}
+                className="shrink-0 ml-2 px-1.5 py-0.5 rounded text-[11px] text-gray-500 hover:text-red-600 hover:bg-red-50 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                title="清空目前對話，開始新話題"
+              >
+                🗑️ 新話題
+              </button>
+            </div>
             {/* Messages */}
             <div className="flex-1 overflow-y-auto p-2.5 space-y-2.5">
               {messages.map((msg, i) => (
