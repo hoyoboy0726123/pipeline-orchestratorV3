@@ -137,6 +137,7 @@ def find_template(
     multi_scale: bool = True,
     near_xy: Optional[tuple[int, int]] = None,
     search_radius: int = 400,
+    region: Optional[tuple[int, int, int, int]] = None,
     mode: str = "gray",
 ) -> MatchResult:
     """在當前螢幕找指定模板圖，回傳中心座標與相似度。
@@ -150,9 +151,11 @@ def find_template(
       - "edge"：Canny 邊緣偵測後再比對 — 兩張圖都先跑 Canny 只留輪廓，
                對色彩/光線/hover 動畫等差異更容忍（conf 通常略低但更穩）
 
-    near_xy: 若給，只在該絕對桌面座標 ±search_radius px 的範圍內搜尋。
-             避免 80×80 小錨點在多螢幕大畫面上找到錯位置的假陽性。
-             搜尋不到會回傳 found=False（呼叫端可決定是否退回全畫面搜尋）。
+    搜尋範圍優先序（三選一）：
+      region 給定 > near_xy 給定 > 全螢幕
+      - region: (left, top, width, height) 虛擬桌面絕對座標，使用者明確指定的紅框
+      - near_xy: 錄製座標附近 ±search_radius px 的方形範圍（自動退回舊行為）
+      - 皆未給：整個虛擬桌面都找（速度最慢、誤匹配風險最高）
     """
     import cv2
 
@@ -177,9 +180,24 @@ def find_template(
         tpl_proc_full = tpl_gray
         screen_proc_full = screen_gray_full
 
-    # 若有 near_xy 就先裁切出該區域，只在其中找，避免跨螢幕誤匹配
+    # 三選一裁切策略：region > near_xy > 全螢幕
     clip_offset_x, clip_offset_y = origin_x, origin_y
-    if near_xy is not None:
+    if region is not None:
+        # 使用者明確指定的搜尋矩形（絕對桌面座標）
+        rl, rt, rw, rh = region
+        rel_x = rl - origin_x
+        rel_y = rt - origin_y
+        H, W = screen_proc_full.shape
+        left = max(0, rel_x)
+        top = max(0, rel_y)
+        right = min(W, rel_x + rw)
+        bottom = min(H, rel_y + rh)
+        if right - left < 20 or bottom - top < 20:
+            return MatchResult(False, reason=f"search_region ({rl},{rt},{rw},{rh}) 與目前桌面範圍重疊不足")
+        screen_proc = screen_proc_full[top:bottom, left:right]
+        clip_offset_x = origin_x + left
+        clip_offset_y = origin_y + top
+    elif near_xy is not None:
         nx, ny = near_xy
         # 絕對座標 → 相對截圖的座標
         rel_x = nx - origin_x
@@ -250,6 +268,21 @@ class ActionResult:
 def _check_abort(run_id: Optional[str]) -> None:
     if _should_abort(run_id):
         raise RuntimeError("使用者中止（emergency abort）")
+
+
+def _parse_search_region(action: dict) -> Optional[tuple[int, int, int, int]]:
+    """解析 action['search_region'] = [left, top, width, height]（虛擬桌面絕對座標）。
+    格式不對或尺寸 <= 0 回 None（代表不限制，走 near_xy / 全螢幕邏輯）。"""
+    sr = action.get("search_region") or []
+    if not isinstance(sr, (list, tuple)) or len(sr) != 4:
+        return None
+    try:
+        l, t, w, h = int(sr[0]), int(sr[1]), int(sr[2]), int(sr[3])
+    except (TypeError, ValueError):
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    return (l, t, w, h)
 
 
 def _pyautogui_with_failsafe():
@@ -420,22 +453,26 @@ def execute_action(
             _SETTLE_RETRIES = 2          # 第一次 + 最多 1 次 retry
             _SETTLE_WAIT_MS = 150        # retry 前 sleep
 
+            # 使用者明確指定的搜尋紅框（優先於錄製座標附近搜尋）
+            region_rect = _parse_search_region(action)
+
             def _search(nx_: Optional[int], ny_: Optional[int]) -> MatchResult:
                 """先跑 gray 模式，若 conf < threshold 再跑 edge 模式，取較高 conf。
-                edge 對 hover fade / 主題色差異更容忍，代價 +20ms。"""
-                if nx_ is not None and ny_ is not None:
-                    gray = find_template(str(tpl_path), threshold=threshold, multi_scale=True,
-                                         near_xy=(nx_, ny_), search_radius=cv_search_radius, mode="gray")
-                else:
-                    gray = find_template(str(tpl_path), threshold=threshold, multi_scale=True, mode="gray")
+                edge 對 hover fade / 主題色差異更容忍，代價 +20ms。
+                搜尋區域優先序：region_rect > near_xy + radius > 全螢幕。"""
+                def _find(m: str) -> MatchResult:
+                    if region_rect is not None:
+                        return find_template(str(tpl_path), threshold=threshold, multi_scale=True,
+                                             region=region_rect, mode=m)
+                    if nx_ is not None and ny_ is not None:
+                        return find_template(str(tpl_path), threshold=threshold, multi_scale=True,
+                                             near_xy=(nx_, ny_), search_radius=cv_search_radius, mode=m)
+                    return find_template(str(tpl_path), threshold=threshold, multi_scale=True, mode=m)
+                gray = _find("gray")
                 if gray.found:
                     return gray
                 # Gray 沒過門檻 → 試 edge 救一下
-                if nx_ is not None and ny_ is not None:
-                    edge = find_template(str(tpl_path), threshold=threshold, multi_scale=True,
-                                         near_xy=(nx_, ny_), search_radius=cv_search_radius, mode="edge")
-                else:
-                    edge = find_template(str(tpl_path), threshold=threshold, multi_scale=True, mode="edge")
+                edge = _find("edge")
                 # 以 conf 做仲裁，但考量 edge 先天分數偏低，edge 要多給 0.05 才可以勝出
                 # 避免 gray 比較接近但仍低、edge 亂抓到邊緣多的位置
                 if edge.found or edge.confidence >= gray.confidence + 0.05:
@@ -566,11 +603,13 @@ def execute_action(
             tpl_path = assets_dir / img_name
             timeout = float(action.get("timeout_sec", 10.0))
             threshold = float(action.get("confidence", 0.85))
+            region_rect = _parse_search_region(action)
             deadline = time.time() + timeout
             last_conf = 0.0
             while time.time() < deadline:
                 _check_abort(run_id)
-                m = find_template(str(tpl_path), threshold=threshold, multi_scale=True)
+                m = find_template(str(tpl_path), threshold=threshold, multi_scale=True,
+                                  region=region_rect)
                 if m.found:
                     msg = f"{img_name} 出現（conf={m.confidence:.2f}）"
                     break
@@ -770,12 +809,14 @@ def execute_action(
             tpl_path = assets_dir / img_name
             timeout = float(action.get("timeout_sec", 2.0))
             threshold = float(action.get("confidence") or cv_threshold)
+            region_rect = _parse_search_region(action)
             deadline = time.time() + timeout
             last_conf = 0.0
             found_m: Optional[MatchResult] = None
             while True:
                 _check_abort(run_id)
-                m = find_template(str(tpl_path), threshold=threshold, multi_scale=True)
+                m = find_template(str(tpl_path), threshold=threshold, multi_scale=True,
+                                  region=region_rect)
                 if m.found:
                     found_m = m
                     break

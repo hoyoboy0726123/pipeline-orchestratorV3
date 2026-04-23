@@ -93,6 +93,11 @@ class ComputerUseAction(BaseModel):
     # activate_window 專用：至少要填 title 或 title_contains 其一
     title: str = ""              # 精確視窗標題比對
     title_contains: str = ""     # 視窗標題子字串比對（大小寫不敏感）
+    # CV 搜尋矩形（per-action 紅框，虛擬桌面絕對座標）。格式 [left, top, width, height]。
+    # 給定時覆蓋預設的「錄製座標 ±cv_search_radius」範圍搜尋，適用於：
+    #   1. 目標區域大、半徑 400 不夠；2. 有多個相似 UI 元素要精準定位；3. 加速（更小區域 = 更快）
+    # click_image / wait_image / assert_image 都支援
+    search_region: list[int] = []
 
 
 class PipelineStep(BaseModel):
