@@ -285,6 +285,341 @@ def _parse_search_region(action: dict) -> Optional[tuple[int, int, int, int]]:
     return (l, t, w, h)
 
 
+# ── VLM（視覺 LLM）比對：第 4 種 primary mode，OCR 同級 peer ──────
+# 設計原則：
+#   1. 純「新增」不改舊：use_ocr / use_coord 關掉 + use_vlm=True 才走這條
+#   2. 截圖流程沿用 _capture_screen() 不變；送 VLM 前 JPEG q=70 壓縮省 token
+#   3. 有 search_region 就送裁切後的小圖（更省 token + 更精準）
+#   4. VLM 吐 JSON 座標 → 絕對桌面座標 → 走現有 _do_click primitive
+#   5. 解析失敗、座標超出螢幕一律視為 found=false，由 vlm_cv_fallback 決定退不退
+
+_VLM_JPEG_QUALITY = 70
+# 解析 LLM 回應時容忍前後有 ```json 包裝或多餘文字，抓最外層 {...}
+_VLM_JSON_RE = None  # lazy init
+
+
+def _encode_bgr_to_jpeg_b64(bgr: np.ndarray, quality: int = _VLM_JPEG_QUALITY) -> Optional[str]:
+    """把 BGR ndarray 編成 JPEG base64 字串（送 VLM 用）。失敗回 None。"""
+    import base64
+    import cv2
+    ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    if not ok:
+        return None
+    return base64.b64encode(buf.tobytes()).decode("ascii")
+
+
+def _encode_file_to_jpeg_b64(path: Path, quality: int = _VLM_JPEG_QUALITY) -> Optional[str]:
+    """讀檔 → 解碼 → 重新 JPEG 壓縮 → base64。PNG 錨點圖也會被轉 JPEG 省 token。"""
+    import cv2
+    try:
+        buf = np.frombuffer(path.read_bytes(), dtype=np.uint8)
+        img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    except Exception:
+        return None
+    if img is None:
+        return None
+    return _encode_bgr_to_jpeg_b64(img, quality)
+
+
+def _parse_vlm_json(text: str) -> Optional[dict]:
+    """從 LLM 回應中抓出 JSON 物件。容忍 ```json 包裝 / 前後廢話。失敗回 None。"""
+    import re
+    global _VLM_JSON_RE
+    if _VLM_JSON_RE is None:
+        # 非貪婪匹配最外層 {...}
+        _VLM_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
+    if not text:
+        return None
+    m = _VLM_JSON_RE.search(text)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def _point_in_virtual_desktop(x: int, y: int) -> bool:
+    """內部 util：VLM 回的座標是否落在目前任一螢幕上。超出視為 hallucination 不點。"""
+    ok, _ = _point_in_any_screen(x, y)
+    return ok
+
+
+def _vlm_invoke(messages_content: list, model_override: str, logger: logging.Logger) -> Optional[str]:
+    """用 llm_factory.build_llm() 叫目前設定的模型，回傳 str（VLM 的文字回應）。失敗 None。
+    model_override 預留給未來 action 層級覆蓋模型（目前忽略，走 settings）。"""
+    try:
+        # 延遲 import 避免 pipeline/computer_use 在沒裝 LLM deps 環境載入失敗
+        import sys as _sys
+        import os as _os
+        _backend_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+        if _backend_root not in _sys.path:
+            _sys.path.insert(0, _backend_root)
+        from llm_factory import build_llm  # type: ignore
+        from langchain_core.messages import HumanMessage  # type: ignore
+    except Exception as e:
+        logger.error(f"[computer_use/vlm] 無法載入 LLM stack：{e}")
+        return None
+
+    try:
+        llm = build_llm(temperature=0.0)
+    except Exception as e:
+        logger.error(f"[computer_use/vlm] build_llm 失敗：{e}")
+        return None
+
+    try:
+        resp = llm.invoke([HumanMessage(content=messages_content)])
+        # langchain BaseMessage .content 可能是 str 或 list（多模態回應）
+        content = resp.content
+        if isinstance(content, list):
+            parts = []
+            for p in content:
+                if isinstance(p, dict) and p.get("type") == "text":
+                    parts.append(str(p.get("text", "")))
+                elif isinstance(p, str):
+                    parts.append(p)
+            content = "\n".join(parts)
+        return str(content or "")
+    except Exception as e:
+        logger.error(f"[computer_use/vlm] LLM 呼叫失敗：{e}")
+        return None
+
+
+@dataclass
+class VlmResult:
+    found: bool
+    x: int = 0
+    y: int = 0
+    confidence: float = 0.0
+    primitive: str = ""       # 僅 vlm_action 使用：click/type_text/hotkey/drag
+    primitive_args: dict = None  # type: ignore[assignment]
+    reason: str = ""
+
+
+def _vlm_locate(
+    screen_bgr: np.ndarray,
+    origin_x: int, origin_y: int,
+    anchor_path: Optional[Path],
+    prompt_extra: str,
+    region: Optional[tuple[int, int, int, int]],
+    model_override: str,
+    logger: logging.Logger,
+) -> VlmResult:
+    """VLM 找錨點：送截圖（+ 可選錨點圖）給 VLM，回傳桌面絕對座標。
+    region 有給就只送裁切後的小圖（省 token、更準）；否則送整個虛擬桌面截圖。"""
+    import cv2
+    # 決定要送的截圖範圍：region 優先，否則整個虛擬桌面
+    base_x = origin_x
+    base_y = origin_y
+    to_send = screen_bgr
+    if region is not None:
+        rl, rt, rw, rh = region
+        rel_x = rl - origin_x
+        rel_y = rt - origin_y
+        H, W = screen_bgr.shape[:2]
+        left = max(0, rel_x)
+        top = max(0, rel_y)
+        right = min(W, rel_x + rw)
+        bottom = min(H, rel_y + rh)
+        if right - left < 20 or bottom - top < 20:
+            return VlmResult(False, reason=f"search_region ({rl},{rt},{rw},{rh}) 與目前桌面範圍重疊不足")
+        to_send = screen_bgr[top:bottom, left:right]
+        base_x = origin_x + left
+        base_y = origin_y + top
+
+    img_h, img_w = to_send.shape[:2]
+    screen_b64 = _encode_bgr_to_jpeg_b64(to_send)
+    if screen_b64 is None:
+        return VlmResult(False, reason="截圖 JPEG 編碼失敗")
+
+    anchor_b64 = None
+    if anchor_path is not None:
+        anchor_b64 = _encode_file_to_jpeg_b64(anchor_path)
+        if anchor_b64 is None:
+            logger.warning(f"[computer_use/vlm] 錨點圖讀不到或解碼失敗：{anchor_path}（繼續不含錨點）")
+
+    text_parts = [
+        "You are a UI element localization assistant. Given a screenshot, find the pixel center of the target UI element.",
+        f"Screenshot is {img_w}×{img_h} pixels. Origin (0,0) is the upper-left corner; x increases to the right, y increases downward.",
+    ]
+    if anchor_b64:
+        text_parts.append("The FIRST image below is the target's anchor (small crop from a previous recording). The SECOND image is the current full screenshot. Find the anchor's location in the full screenshot.")
+    else:
+        text_parts.append("No anchor image is provided; rely on the description below.")
+    if prompt_extra:
+        text_parts.append(f"Additional description of the target: {prompt_extra}")
+    text_parts.append(
+        "Reply with ONLY a single-line JSON object, no markdown, no prose:\n"
+        "{\"found\": true, \"x\": <int>, \"y\": <int>, \"confidence\": <0.0-1.0>, \"reason\": \"<short>\"}\n"
+        "If you cannot confidently identify the target, reply:\n"
+        "{\"found\": false, \"confidence\": 0.0, \"reason\": \"<why>\"}"
+    )
+    text_prompt = "\n".join(text_parts)
+
+    content: list = [{"type": "text", "text": text_prompt}]
+    if anchor_b64:
+        content.append({"type": "image_url", "image_url": f"data:image/jpeg;base64,{anchor_b64}"})
+    content.append({"type": "image_url", "image_url": f"data:image/jpeg;base64,{screen_b64}"})
+
+    raw = _vlm_invoke(content, model_override, logger)
+    if raw is None:
+        return VlmResult(False, reason="VLM 呼叫失敗")
+    parsed = _parse_vlm_json(raw)
+    if parsed is None:
+        return VlmResult(False, reason=f"VLM 回應無法解析為 JSON：{raw[:120]}")
+    if not parsed.get("found"):
+        return VlmResult(False, confidence=float(parsed.get("confidence", 0.0) or 0.0),
+                         reason=str(parsed.get("reason", "VLM 回 found=false")))
+    # 轉絕對桌面座標
+    try:
+        img_x = int(parsed["x"])
+        img_y = int(parsed["y"])
+    except (KeyError, TypeError, ValueError):
+        return VlmResult(False, reason=f"VLM 回應缺 x/y 或非整數：{parsed}")
+    abs_x = img_x + base_x
+    abs_y = img_y + base_y
+    if not _point_in_virtual_desktop(abs_x, abs_y):
+        return VlmResult(False, x=abs_x, y=abs_y,
+                         confidence=float(parsed.get("confidence", 0.0) or 0.0),
+                         reason=f"VLM 回座標 ({abs_x},{abs_y}) 超出目前桌面範圍 → 視為失敗")
+    return VlmResult(
+        found=True, x=abs_x, y=abs_y,
+        confidence=float(parsed.get("confidence", 0.0) or 0.0),
+        reason=str(parsed.get("reason", "")),
+    )
+
+
+_VLM_PRIMITIVE_ALL = ("click", "double_click", "right_click", "type_text", "hotkey", "drag")
+
+
+def _vlm_decide_action(
+    screen_bgr: np.ndarray,
+    origin_x: int, origin_y: int,
+    description: str,
+    prompt_extra: str,
+    region: Optional[tuple[int, int, int, int]],
+    allowed: list[str],
+    model_override: str,
+    logger: logging.Logger,
+) -> VlmResult:
+    """vlm_action 專用：送截圖 + 自然語言目標，VLM 回「要做什麼 primitive + 參數」。
+    allowed 空 list = 全部允許；非空 = 白名單（step 層級的 vlm_allowed_primitives）。"""
+    base_x = origin_x
+    base_y = origin_y
+    to_send = screen_bgr
+    if region is not None:
+        rl, rt, rw, rh = region
+        rel_x = rl - origin_x
+        rel_y = rt - origin_y
+        H, W = screen_bgr.shape[:2]
+        left = max(0, rel_x)
+        top = max(0, rel_y)
+        right = min(W, rel_x + rw)
+        bottom = min(H, rel_y + rh)
+        if right - left < 20 or bottom - top < 20:
+            return VlmResult(False, reason=f"search_region 與桌面重疊不足")
+        to_send = screen_bgr[top:bottom, left:right]
+        base_x = origin_x + left
+        base_y = origin_y + top
+
+    img_h, img_w = to_send.shape[:2]
+    screen_b64 = _encode_bgr_to_jpeg_b64(to_send)
+    if screen_b64 is None:
+        return VlmResult(False, reason="截圖 JPEG 編碼失敗")
+
+    effective_allowed = [p for p in (allowed or _VLM_PRIMITIVE_ALL) if p in _VLM_PRIMITIVE_ALL]
+    if not effective_allowed:
+        effective_allowed = list(_VLM_PRIMITIVE_ALL)
+
+    text = (
+        "You decide ONE desktop-automation primitive to execute based on the screenshot and the task description.\n"
+        f"Screenshot is {img_w}×{img_h} px; origin (0,0) upper-left.\n"
+        f"Task: {description}\n"
+        + (f"Extra context: {prompt_extra}\n" if prompt_extra else "")
+        + "Allowed primitives (pick EXACTLY ONE):\n"
+          "- click: {\"primitive\":\"click\",\"x\":<int>,\"y\":<int>,\"button\":\"left|right|middle\",\"clicks\":1}\n"
+          "- double_click: {\"primitive\":\"double_click\",\"x\":<int>,\"y\":<int>}\n"
+          "- right_click: {\"primitive\":\"right_click\",\"x\":<int>,\"y\":<int>}\n"
+          "- type_text: {\"primitive\":\"type_text\",\"text\":\"...\"}\n"
+          "- hotkey: {\"primitive\":\"hotkey\",\"keys\":[\"ctrl\",\"c\"]}\n"
+          "- drag: {\"primitive\":\"drag\",\"x\":<int>,\"y\":<int>,\"x2\":<int>,\"y2\":<int>}\n"
+          f"ONLY these primitives are allowed this step: {effective_allowed}\n"
+          "Coordinates are image-local (relative to the screenshot upper-left).\n"
+          "Reply JSON ONLY, single line, no markdown:\n"
+          "{\"found\":true,\"primitive\":\"<name>\",...args...,\"confidence\":0.9,\"reason\":\"<short>\"}\n"
+          "If the target is not visible or cannot be acted upon:\n"
+          "{\"found\":false,\"confidence\":0.0,\"reason\":\"<why>\"}"
+    )
+
+    content = [
+        {"type": "text", "text": text},
+        {"type": "image_url", "image_url": f"data:image/jpeg;base64,{screen_b64}"},
+    ]
+    raw = _vlm_invoke(content, model_override, logger)
+    if raw is None:
+        return VlmResult(False, reason="VLM 呼叫失敗")
+    parsed = _parse_vlm_json(raw)
+    if parsed is None:
+        return VlmResult(False, reason=f"VLM 回應無法解析為 JSON：{raw[:120]}")
+    if not parsed.get("found"):
+        return VlmResult(False, confidence=float(parsed.get("confidence", 0.0) or 0.0),
+                         reason=str(parsed.get("reason", "VLM 回 found=false")))
+    prim = str(parsed.get("primitive", "")).strip()
+    if prim not in effective_allowed:
+        return VlmResult(False, reason=f"VLM 回傳 primitive='{prim}' 不在允許清單 {effective_allowed}")
+
+    args: dict = {}
+    if prim in ("click", "double_click", "right_click", "drag"):
+        try:
+            img_x = int(parsed["x"])
+            img_y = int(parsed["y"])
+        except (KeyError, TypeError, ValueError):
+            return VlmResult(False, reason=f"{prim} 缺 x/y 或非整數")
+        abs_x = img_x + base_x
+        abs_y = img_y + base_y
+        if not _point_in_virtual_desktop(abs_x, abs_y):
+            return VlmResult(False, reason=f"VLM 回座標 ({abs_x},{abs_y}) 超出桌面範圍")
+        args["x"] = abs_x
+        args["y"] = abs_y
+        if prim == "click":
+            args["button"] = str(parsed.get("button", "left"))
+            try:
+                args["clicks"] = int(parsed.get("clicks", 1))
+            except (TypeError, ValueError):
+                args["clicks"] = 1
+        if prim == "drag":
+            try:
+                img_x2 = int(parsed["x2"])
+                img_y2 = int(parsed["y2"])
+            except (KeyError, TypeError, ValueError):
+                return VlmResult(False, reason="drag 缺 x2/y2")
+            abs_x2 = img_x2 + base_x
+            abs_y2 = img_y2 + base_y
+            if not _point_in_virtual_desktop(abs_x2, abs_y2):
+                return VlmResult(False, reason=f"drag 終點 ({abs_x2},{abs_y2}) 超出桌面範圍")
+            args["x2"] = abs_x2
+            args["y2"] = abs_y2
+            args["button"] = str(parsed.get("button", "left"))
+    elif prim == "type_text":
+        args["text"] = str(parsed.get("text", ""))
+        if not args["text"]:
+            return VlmResult(False, reason="type_text 缺 text")
+    elif prim == "hotkey":
+        keys = parsed.get("keys", [])
+        if not isinstance(keys, list) or not keys:
+            return VlmResult(False, reason="hotkey 缺 keys 或格式不對")
+        args["keys"] = [str(k) for k in keys]
+
+    return VlmResult(
+        found=True,
+        x=args.get("x", 0), y=args.get("y", 0),
+        primitive=prim,
+        primitive_args=args,
+        confidence=float(parsed.get("confidence", 0.0) or 0.0),
+        reason=str(parsed.get("reason", "")),
+    )
+
+
 def _pyautogui_with_failsafe():
     """lazy import pyautogui 並設好 failsafe / 節流"""
     import pyautogui
@@ -328,6 +663,7 @@ def execute_action(
     cv_coord_fallback: bool = False,
     ocr_threshold: float = 0.6,
     ocr_cv_fallback: bool = False,
+    vlm_allowed_primitives: Optional[list[str]] = None,
 ) -> ActionResult:
     """執行單一 action。action 是 ComputerUseAction.model_dump() 結果的 dict。"""
     t0 = time.time()
@@ -357,20 +693,23 @@ def execute_action(
             modifiers = list(action.get("modifiers", []) or [])
             mods_tag = f"[{'+'.join(modifiers)}]" if modifiers else ""
 
-            # 三種 primary mode 獨立互不 coupling（per user feedback），但執行時還是要
+            # 四種 primary mode 獨立互不 coupling（per user feedback），但執行時還是要
             # 有優先順序。直覺是「使用者明確勾起來的 mode 優先」：
-            #   OCR 勾起 + 有 ocr_text → 走 OCR（不管 use_coord 是 true/false）
-            #   OCR 沒勾 + use_coord=true → 走絕對座標
-            #   OCR 沒勾 + use_coord=false → 走 CV 圖像比對
-            # 先讀 OCR 旗標，再決定是否短路到座標模式
+            #   OCR 勾起 + 有 ocr_text → 走 OCR
+            #   VLM 勾起              → 走 VLM（第 4 種模式，送截圖+錨點給視覺 LLM 找位置）
+            #   OCR / VLM 都沒勾 + use_coord=true → 走絕對座標
+            #   都沒勾 + use_coord=false → 走 CV 圖像比對
+            # 優先序 OCR > VLM 是因為 OCR 更快更便宜；兩個都勾預設走 OCR
             use_ocr = bool(action.get("use_ocr", False))
             ocr_text = (action.get("ocr_text") or "").strip()
             ocr_will_run = use_ocr and bool(ocr_text)
+            use_vlm = bool(action.get("use_vlm", False))
+            vlm_will_run = use_vlm and not ocr_will_run
 
             # 預設使用絕對座標（快速且穩定）；只有使用者主動切到圖像比對模式才跑 template matching
             # 注意：get 第二引數 True 表示若 action 根本沒 use_coord 欄位，也視為座標模式
-            # OCR 有啟用就跳過座標短路，讓 OCR 先試（失敗再依 ocr_cv_fallback 決定退不退）
-            if action.get("use_coord", True) and has_coord and not ocr_will_run:
+            # OCR/VLM 有啟用就跳過座標短路，讓新模式先試（失敗再依各自 fallback 決定退不退）
+            if action.get("use_coord", True) and has_coord and not ocr_will_run and not vlm_will_run:
                 _do_click(pg, int(fx), int(fy), button, clicks, hold_sec, modifiers)
                 hold_tag = f" hold={hold_sec}s" if hold_sec > 0.1 else ""
                 msg = f"[強制座標]{mods_tag} 點擊 ({fx},{fy}) button={button} clicks={clicks}{hold_tag}"
@@ -381,8 +720,8 @@ def execute_action(
             # Hover 預熱：錄製當下游標停在按鈕上、錨點擷取到 Windows hover highlight
             # 狀態；回放用 pyautogui 瞬移沒觸發 hover → 螢幕與錨點不一樣 conf 掉
             # 把游標移到錄製座標附近、等指定 ms 讓 hover 效果渲染後再比對
-            # OCR 模式跳過 hover（純文字偵測不受 hover 影響，而且可能反而干擾游標位置）
-            if cv_trigger_hover and has_coord and not ocr_will_run:
+            # OCR / VLM 模式跳過 hover（文字偵測/VLM 不靠 hover 效果）
+            if cv_trigger_hover and has_coord and not ocr_will_run and not vlm_will_run:
                 try:
                     pg.moveTo(int(fx), int(fy))
                     time.sleep(max(50, int(cv_hover_wait_ms)) / 1000.0)
@@ -441,6 +780,39 @@ def execute_action(
                 elif not ocr_cv_fallback:
                     # OCR 模組載不進來且使用者沒開 fallback → 直接 FAIL（不偷偷走 CV）
                     return ActionResult(False, index, atype, "OCR 模組無法載入且 ocr_cv_fallback=off")
+
+            # ── VLM 模式分支（第 4 種 primary mode）──
+            # 送「全螢幕截圖 + 錨點圖 + 可選自然語言描述」給視覺 LLM，回傳要點擊的座標。
+            # 失敗行為：vlm_cv_fallback=False（預設）→ 立即 FAIL；=True → 繼續走下面 CV 鏈。
+            # 搜尋範圍：若 action 有 search_region 就只送裁切圖（省 token 更準）；否則送全桌面。
+            if vlm_will_run:
+                vlm_cv_fallback = bool(action.get("vlm_cv_fallback", False))
+                vlm_prompt = str(action.get("vlm_prompt", "") or "")
+                vlm_model = str(action.get("vlm_model", "") or "")
+                region_rect_vlm = _parse_search_region(action)
+                screen_bgr_vlm, vsx, vsy = _capture_screen()
+                vlm_res = _vlm_locate(
+                    screen_bgr_vlm, vsx, vsy,
+                    anchor_path=(tpl_path if tpl_path.is_file() else None),
+                    prompt_extra=vlm_prompt,
+                    region=region_rect_vlm,
+                    model_override=vlm_model,
+                    logger=logger,
+                )
+                if vlm_res.found:
+                    _do_click(pg, vlm_res.x, vlm_res.y, button, clicks, hold_sec, modifiers)
+                    hold_tag = f" hold={hold_sec}s" if hold_sec > 0.1 else ""
+                    msg = (f"{mods_tag} 點擊 VLM 找到的位置 @ ({vlm_res.x},{vlm_res.y}) "
+                           f"(conf={vlm_res.confidence:.2f}){hold_tag}")
+                    duration = int((time.time() - t0) * 1000)
+                    logger.info(f"[computer_use]   ✓ {msg}（{duration}ms）")
+                    return ActionResult(True, index, atype, msg, duration)
+                # VLM 失敗
+                if not vlm_cv_fallback:
+                    fail_msg = f"VLM 失敗：{vlm_res.reason}（vlm_cv_fallback=off → 直接 FAIL）"
+                    logger.error(f"[computer_use]   ✗ {fail_msg}")
+                    return ActionResult(False, index, atype, fail_msg)
+                logger.info(f"[computer_use]   VLM 失敗：{vlm_res.reason[:120]}，vlm_cv_fallback=on → 改試 CV 比對")
 
             # 搜尋策略：
             # 1. 有錄製座標 → 先在附近 ±cv_search_radius 範圍搜尋（防跨螢幕假陽性）
@@ -879,6 +1251,68 @@ def execute_action(
             msg = (f"assert 通過：文字 '{text}' 可見 @ {found_ocr.center} "
                    f"(matched='{found_ocr.text[:30]}', conf={found_ocr.confidence:.2f})")
 
+        elif atype == "vlm_action":
+            # 自由形式 VLM 動作：沒有錨點圖，用自然語言描述 → VLM 看截圖決定要做哪個 primitive。
+            # VLM 輸出受白名單限制，最終仍走現有 pyautogui primitive（不發明新動作）。
+            description = (action.get("description") or action.get("vlm_prompt") or "").strip()
+            if not description:
+                return ActionResult(False, index, atype,
+                    "vlm_action 缺 description（自然語言目標必填）")
+            vlm_prompt = str(action.get("vlm_prompt", "") or "")
+            vlm_model = str(action.get("vlm_model", "") or "")
+            region_rect_vlm = _parse_search_region(action)
+            allowed = list(vlm_allowed_primitives or [])
+            screen_bgr_vlm, vsx, vsy = _capture_screen()
+            decision = _vlm_decide_action(
+                screen_bgr_vlm, vsx, vsy,
+                description=description,
+                prompt_extra=vlm_prompt,
+                region=region_rect_vlm,
+                allowed=allowed,
+                model_override=vlm_model,
+                logger=logger,
+            )
+            if not decision.found:
+                return ActionResult(False, index, atype,
+                    f"VLM 無法決定動作：{decision.reason}")
+            # 按 VLM 決定的 primitive 送到既有 primitive 執行路徑
+            args = decision.primitive_args or {}
+            prim = decision.primitive
+            if prim == "click":
+                _do_click(pg, args["x"], args["y"],
+                          args.get("button", "left"), int(args.get("clicks", 1)), 0.0, [])
+            elif prim == "double_click":
+                _do_click(pg, args["x"], args["y"], "left", 2, 0.0, [])
+            elif prim == "right_click":
+                _do_click(pg, args["x"], args["y"], "right", 1, 0.0, [])
+            elif prim == "type_text":
+                txt = args["text"]
+                if any(ord(c) > 127 for c in txt):
+                    import pyperclip
+                    try:
+                        pyperclip.copy(txt)
+                        pg.hotkey("ctrl", "v")
+                    except Exception:
+                        pg.write(txt, interval=0.03)
+                else:
+                    pg.write(txt, interval=0.03)
+            elif prim == "hotkey":
+                pg.hotkey(*args["keys"])
+            elif prim == "drag":
+                # 簡化的 drag：先 moveTo 起點、mouseDown → moveTo 終點 → mouseUp。
+                # 不重現 click_image 那套 OLE DragDetect 路徑（那是給錄製流程的，VLM 互動場景少見）。
+                pg.moveTo(args["x"], args["y"])
+                pg.mouseDown(button=args.get("button", "left"))
+                try:
+                    pg.moveTo(args["x2"], args["y2"], duration=0.5)
+                finally:
+                    pg.mouseUp(button=args.get("button", "left"))
+            else:
+                return ActionResult(False, index, atype,
+                    f"VLM 回傳未支援的 primitive：{prim}")
+            msg = (f"VLM 決定 '{prim}' @ conf={decision.confidence:.2f}"
+                   f"（reason：{decision.reason[:80]}）")
+
         elif atype == "screenshot":
             import cv2
             img, _ox, _oy = _capture_screen()
@@ -984,6 +1418,7 @@ def execute_computer_use_step(
     cv_coord_fallback: bool = False,
     ocr_threshold: float = 0.6,
     ocr_cv_fallback: bool = False,
+    vlm_allowed_primitives: Optional[list[str]] = None,
 ) -> StepResult:
     """執行一整個 computer_use 步驟。
 
@@ -1049,7 +1484,8 @@ def execute_computer_use_step(
                                  cv_hover_wait_ms=cv_hover_wait_ms,
                                  cv_coord_fallback=cv_coord_fallback,
                                  ocr_threshold=ocr_threshold,
-                                 ocr_cv_fallback=ocr_cv_fallback)
+                                 ocr_cv_fallback=ocr_cv_fallback,
+                                 vlm_allowed_primitives=vlm_allowed_primitives)
         except RuntimeError as abort_err:
             logger.warning(f"[computer_use] {abort_err}")
             return StepResult(

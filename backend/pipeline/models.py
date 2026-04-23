@@ -53,8 +53,9 @@ class ComputerUseAction(BaseModel):
       - assert_image：驗證某錨點圖「當下」必須可見，否則步驟失敗（短 timeout）
       - assert_text：OCR 驗證螢幕上必須有某段文字，否則步驟失敗
       - activate_window：把指定標題的視窗切到前景（解決錄製回放時視窗不在前的常見問題）
+      - vlm_action：用自然語言描述目標 + VLM 視覺大模型決定要做什麼 primitive，不需錨點圖
     """
-    type: str  # click_image | click_at | type_text | hotkey | wait | wait_image | screenshot | scroll | drag | assert_image | assert_text | activate_window
+    type: str  # click_image | click_at | type_text | hotkey | wait | wait_image | screenshot | scroll | drag | assert_image | assert_text | activate_window | vlm_action
     image: str = ""       # 主錨點圖檔名（相對 assets_dir）
     image2: str = ""      # 次錨點圖檔名（多錨點驗證用，選填）
     dx2: int = 0          # 次錨點相對點擊點的位移 x
@@ -96,8 +97,15 @@ class ComputerUseAction(BaseModel):
     # CV 搜尋矩形（per-action 紅框，虛擬桌面絕對座標）。格式 [left, top, width, height]。
     # 給定時覆蓋預設的「錄製座標 ±cv_search_radius」範圍搜尋，適用於：
     #   1. 目標區域大、半徑 400 不夠；2. 有多個相似 UI 元素要精準定位；3. 加速（更小區域 = 更快）
-    # click_image / wait_image / assert_image 都支援
+    # click_image / wait_image / assert_image / vlm_action 都支援
     search_region: list[int] = []
+    # ── VLM 視覺大模型比對（第 4 種 primary mode，peer to use_ocr / use_coord）──
+    # 截圖流程完全不變：繼續用 _capture_screen() 抓全螢幕，送 VLM 前 JPEG q=70 壓縮節省 token。
+    # 優先序：use_ocr 勾 → 走 OCR；未勾 + use_vlm 勾 → 走 VLM；皆未勾 → 走座標/CV
+    use_vlm: bool = False         # click_image 專用：勾起來就用 VLM 找位置（送截圖+錨點圖）
+    vlm_prompt: str = ""          # 可選額外自然語言描述（"紅色送出鈕，不是藍色取消"）
+    vlm_cv_fallback: bool = False  # VLM 失敗時是否退回 CV 鏈（類比 ocr_cv_fallback）
+    vlm_model: str = ""           # 可選 override：本動作使用的 VLM 模型名稱（留空 = 用 settings）
 
 
 class PipelineStep(BaseModel):
@@ -134,6 +142,11 @@ class PipelineStep(BaseModel):
     ocr_threshold: float = 0.6     # OCR 最小 confidence：低於這數字視為沒匹配到
                                    # 分級: 1.0 精確 / 0.9 target⊆word / 0.8 跨詞行層級 / 0.6 模糊
     ocr_cv_fallback: bool = False  # True = OCR 失敗時退到 CV 比對鏈（再受 cv_coord_fallback 接棒）；False（預設）= 失敗就 FAIL
+    # ── VLM 比對設定 ──────────────────────────────────────────────────
+    # 白名單：vlm_action 時 VLM 可以回傳哪些 primitive。空 list（預設）= 全部允許
+    # 可用值：click / double_click / right_click / type_text / hotkey / drag
+    # 安全用途：高風險 step 可設 ["click"] 禁止 VLM 亂下 hotkey 或 drag
+    vlm_allowed_primitives: list[str] = []
 
 
 class PipelineConfig(BaseModel):

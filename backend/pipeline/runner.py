@@ -828,6 +828,7 @@ async def run_pipeline(
                         cv_coord_fallback=step.cv_coord_fallback,
                         ocr_threshold=step.ocr_threshold,
                         ocr_cv_fallback=step.ocr_cv_fallback,
+                        vlm_allowed_primitives=step.vlm_allowed_primitives,
                     ),
                 )
                 # 映射回 ExecResult 讓後續驗證/重試邏輯通用
