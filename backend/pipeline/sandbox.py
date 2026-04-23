@@ -124,7 +124,15 @@ def _invalidate_docker_prefix_cache() -> None:
 
 # ── 狀態檢查 ───────────────────────────────────────────────────────
 _STATUS_CACHE: dict = {"ts": 0.0, "data": None}
-_STATUS_TTL = 5.0
+# 分別 TTL：
+#   健康 → cache 久一點（30s），因為剛確認好幾秒內不用重查，避免每個 skill tool 都多跑 ~1s WSL probe
+#   不健康 → cache 短一點（5s），使用者剛修好狀態能快點反映到 UI
+# 先前統一 5s 會讓每次 skill 呼叫都重做一次健康檢查，碰到 WSL 冷啟動
+# （wsl --status 偶爾超過 5s）就誤判「沒裝 WSL」→ fallback 到 host → 路徑錯
+_STATUS_TTL_HEALTHY = 30.0
+_STATUS_TTL_UNHEALTHY = 5.0
+# wsl --status 超時。5s 在 WSL VM 冷啟動時會超 → 誤判為未安裝。實測 8-10s 覆蓋絕大多數情況
+_WSL_STATUS_TIMEOUT = 10.0
 
 
 def check_status(force_refresh: bool = False) -> dict:
@@ -137,24 +145,33 @@ def check_status(force_refresh: bool = False) -> dict:
           "reasons": list[str],    # 使用者可讀的問題描述
           "hint": str,             # 建議下一步動作
         }
-    結果快取 5 秒避免 polling 炸 WSL。"""
+    結果按健康與否套不同 TTL（健康 30s / 不健康 5s）。"""
     now = time.time()
-    if not force_refresh and _STATUS_CACHE["data"] and (now - _STATUS_CACHE["ts"] < _STATUS_TTL):
-        return _STATUS_CACHE["data"]
+    if not force_refresh and _STATUS_CACHE["data"]:
+        ttl = _STATUS_TTL_HEALTHY if _STATUS_CACHE["data"].get("ready") else _STATUS_TTL_UNHEALTHY
+        if now - _STATUS_CACHE["ts"] < ttl:
+            return _STATUS_CACHE["data"]
 
     reasons: list[str] = []
     wsl_ok = False
+    wsl_timed_out = False  # timeout 要跟「真的沒裝」分開提示，不然 hint 誤導
     docker_ok = False
     docker_version = ""
     container_exists = False
     container_running = False
 
     # 1. WSL 可用嗎
-    rc, out, err = _run_wsl(["--status"], timeout=5.0)
+    rc, out, err = _run_wsl(["--status"], timeout=_WSL_STATUS_TIMEOUT)
     if rc == 0:
         wsl_ok = True
     else:
-        reasons.append(f"WSL 無法使用：{err.strip() or '未知'}")
+        # _run_wsl 的 rc 意義：-1=找不到 wsl.exe，-2=timeout，-3=其他例外，>0=WSL 真的回錯
+        # 只有 -2 算「瞬時 timeout 可能可重試」，其他都是比較穩定的真實失敗
+        if rc == -2:
+            wsl_timed_out = True
+            reasons.append(f"WSL `--status` 回應逾時（>{_WSL_STATUS_TIMEOUT}s），可能 VM 冷啟動中")
+        else:
+            reasons.append(f"WSL 無法使用：{err.strip() or f'rc={rc}'}")
 
     # 2. Docker daemon 可用嗎
     if wsl_ok:
@@ -189,7 +206,11 @@ def check_status(force_refresh: bool = False) -> dict:
     ready = wsl_ok and docker_ok and container_running
     hint = ""
     if not wsl_ok:
-        hint = "請先安裝 WSL：開管理員 PowerShell 跑 `wsl --install` 並重啟"
+        hint = (
+            f"WSL 回應逾時（>{_WSL_STATUS_TIMEOUT}s），可能 VM 剛喚醒；稍後自動重試"
+            if wsl_timed_out else
+            "請先安裝 WSL：開管理員 PowerShell 跑 `wsl --install` 並重啟"
+        )
     elif not docker_ok:
         hint = "請跑 sandbox/setup_sandbox.bat 安裝 Docker + 建容器"
     elif not container_exists:
@@ -213,16 +234,30 @@ def check_status(force_refresh: bool = False) -> dict:
 
 
 def ensure_running() -> tuple[bool, str]:
-    """容器若沒跑就試著 start。回傳 (ok, reason)。"""
+    """容器若沒跑就試著 start。回傳 (ok, reason)。
+    先用 cache（健康 30s 內免重查）→ 不 healthy 才強制 refresh → 還是不行的話
+    對瞬時失敗（例如 WSL 冷啟動 timeout）再重試一次，避免單次慢就誤判 fallback。
+    """
+    status = check_status(force_refresh=False)
+    if status["ready"]:
+        return True, ""
+    # 強制重查真實狀態
     status = check_status(force_refresh=True)
     if status["ready"]:
         return True, ""
+    # WSL timeout 類的瞬時失敗 → 重試一次（VM 冷啟動通常第二次會通）
+    if not status.get("wsl_ok") and "逾時" in (status.get("hint") or ""):
+        log.info("[sandbox] 首次 WSL 狀態查詢逾時，重試一次…")
+        status = check_status(force_refresh=True)
+        if status["ready"]:
+            log.info("[sandbox] 重試後健康")
+            return True, ""
+    # 容器存在但停了 → 嘗試 start
     if status["container_exists"] and not status["container_running"]:
         log.info(f"[sandbox] 容器 {CONTAINER_NAME} 已停止，嘗試 docker start …")
         docker_prefix = _detect_docker_prefix()
         rc, _, err = _run_wsl(["-e", *docker_prefix, "start", CONTAINER_NAME], timeout=15.0)
         if rc == 0:
-            # 再查一次狀態
             status = check_status(force_refresh=True)
             if status["ready"]:
                 log.info(f"[sandbox] 容器 {CONTAINER_NAME} 已成功啟動")
