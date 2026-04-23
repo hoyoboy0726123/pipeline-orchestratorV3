@@ -49,8 +49,11 @@ class ComputerUseAction(BaseModel):
       - wait：seconds 靜態等待
       - wait_image：等某張圖出現（含 timeout），常用於等載入完成
       - screenshot：存一張截圖到 assets_dir（方便事後除錯，不影響流程）
+      - drag / scroll：拖曳 / 捲動
+      - assert_image：驗證某錨點圖「當下」必須可見，否則步驟失敗（短 timeout）
+      - assert_text：OCR 驗證螢幕上必須有某段文字，否則步驟失敗
     """
-    type: str  # click_image | click_at | type_text | hotkey | wait | wait_image | screenshot | scroll | drag
+    type: str  # click_image | click_at | type_text | hotkey | wait | wait_image | screenshot | scroll | drag | assert_image | assert_text
     image: str = ""       # 主錨點圖檔名（相對 assets_dir）
     image2: str = ""      # 次錨點圖檔名（多錨點驗證用，選填）
     dx2: int = 0          # 次錨點相對點擊點的位移 x

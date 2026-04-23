@@ -688,6 +688,84 @@ def execute_action(
             mods_tag = f"[{'+'.join(modifiers)}] " if modifiers else ""
             msg = f"{mods_tag}在 ({x},{y}) 捲動 dy={dy}"
 
+        elif atype == "assert_image":
+            # 驗證某張錨點圖「當下」必須可見（和 wait_image 相似但語意不同：
+            # wait_image 等畫面載入、timeout 較長；assert_image 檢查當前狀態、timeout 較短）。
+            # 失敗訊息也更精確，方便排查為什麼流程走到這一步畫面長得不對。
+            img_name = action.get("image", "")
+            if not img_name:
+                return ActionResult(False, index, atype, "assert_image 缺 image 欄位")
+            tpl_path = assets_dir / img_name
+            timeout = float(action.get("timeout_sec", 2.0))
+            threshold = float(action.get("confidence") or cv_threshold)
+            deadline = time.time() + timeout
+            last_conf = 0.0
+            found_m: Optional[MatchResult] = None
+            while True:
+                _check_abort(run_id)
+                m = find_template(str(tpl_path), threshold=threshold, multi_scale=True)
+                if m.found:
+                    found_m = m
+                    break
+                last_conf = max(last_conf, m.confidence)
+                if time.time() >= deadline:
+                    break
+                time.sleep(0.2)
+            if found_m is None:
+                return ActionResult(False, index, atype,
+                    f"assert 失敗：{timeout}s 內 {img_name} 未出現（最佳 {last_conf:.2f} < {threshold}）")
+            msg = f"assert 通過：{img_name} 可見（conf={found_m.confidence:.2f}）"
+
+        elif atype == "assert_text":
+            # OCR 版本的 assert：驗證螢幕上應該有某段文字。
+            # 常見用途：登入成功後檢查「歡迎回來」、錯誤訊息檢查、狀態列文字等。
+            text = (action.get("text") or action.get("ocr_text") or "").strip()
+            if not text:
+                return ActionResult(False, index, atype, "assert_text 缺 text 欄位")
+            find_text_on_screen = None
+            try:
+                from pipeline.ocr import find_text_on_screen
+            except Exception:
+                try:
+                    from .ocr import find_text_on_screen  # type: ignore
+                except Exception as _e:
+                    return ActionResult(False, index, atype, f"無法載入 OCR 模組：{_e}")
+            timeout = float(action.get("timeout_sec", 2.0))
+            threshold = float(action.get("ocr_threshold") or ocr_threshold)
+            # 沿用既有 ocr_box_* 欄位做 OCR 搜尋範圍（藍框）
+            _box_w = int(action.get("ocr_box_width", 0) or 0)
+            _box_h = int(action.get("ocr_box_height", 0) or 0)
+            region = None
+            if _box_w > 0 and _box_h > 0:
+                region = (
+                    int(action.get("ocr_box_left", 0) or 0),
+                    int(action.get("ocr_box_top", 0) or 0),
+                    _box_w, _box_h,
+                )
+            deadline = time.time() + timeout
+            last_reason = ""
+            found_ocr = None
+            while True:
+                _check_abort(run_id)
+                screen_bgr, sx, sy = _capture_screen()
+                ocr_res = find_text_on_screen(
+                    screen_bgr, text, origin_x=sx, origin_y=sy,
+                    lang_tag="zh-Hant-TW",
+                    threshold=threshold, region=region,
+                )
+                if ocr_res.found:
+                    found_ocr = ocr_res
+                    break
+                last_reason = ocr_res.reason
+                if time.time() >= deadline:
+                    break
+                time.sleep(0.3)
+            if found_ocr is None:
+                return ActionResult(False, index, atype,
+                    f"assert 失敗：{timeout}s 內未偵測到文字 '{text}'（{last_reason}）")
+            msg = (f"assert 通過：文字 '{text}' 可見 @ {found_ocr.center} "
+                   f"(matched='{found_ocr.text[:30]}', conf={found_ocr.confidence:.2f})")
+
         elif atype == "screenshot":
             import cv2
             img, _ox, _oy = _capture_screen()
