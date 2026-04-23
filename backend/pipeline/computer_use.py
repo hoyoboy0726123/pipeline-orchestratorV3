@@ -333,7 +333,8 @@ def execute_action(
                         duration = int((time.time() - t0) * 1000)
                         logger.info(f"[computer_use]   ✓ {msg}（{duration}ms）")
                         return ActionResult(True, index, atype, msg, duration)
-                    logger.info(f"[computer_use]   OCR 沒找到 '{ocr_text}'（{ocr_res.reason[:100]}），改用 CV 比對")
+                    # ocr_res.reason 裡已經包含「OCR 沒找到 ...」字樣，直接印它不用再包裝
+                    logger.info(f"[computer_use]   {ocr_res.reason[:120]}，改用 CV 比對")
 
             # 搜尋策略：
             # 1. 有錄製座標 → 先在附近 ±cv_search_radius 範圍搜尋（防跨螢幕假陽性）

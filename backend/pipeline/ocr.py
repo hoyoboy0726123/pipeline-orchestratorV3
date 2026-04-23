@@ -112,16 +112,16 @@ async def _recognize(img_bgr: np.ndarray, lang_tag: Optional[str] = None) -> lis
 
 def _find_target_in_words(words: list[dict], target: str) -> Optional[tuple[dict, float]]:
     """依序嘗試匹配等級，回傳 (最佳 word dict, confidence) 或 None。
-    只允許「目標 ⊆ word/line」方向 — 不接受反向（word ⊆ 目標）否則單字元的誤匹配會炸鍋：
-    例如 target='File' 不該匹到畫面某處單獨的 'L'，那只是因為 'L' 是 'File' 的子字。
+    只允許「目標 ⊆ word/line」方向（不接受反向、否則 target='File' 會匹到單獨的 'L'）。
 
-    等級：
+    匹配等級：
       1. 字對字精確相等 → conf 1.0
       2. 目標為 word 的子字串（target in word）→ conf 0.9
          例：target='File' 匹到 word='FileExplorer'
-      3. 目標為 line 整行的子字串（target in line_text）→ conf 0.8
-         例：target='關閉' 匹到 line='X 關閉'（OCR 把「關」「閉」拆開時救回來）
-      4. 小寫 + 去空白 後 target in word → conf 0.6
+      3. 跨詞：一行內所有 word 拼起來（去空白）含目標 → conf 0.8
+         例：target='我是誰' 匹到 line words=['我','是','誰']（CJK 常見情況）
+             target='File Edit' 匹到 line words=['File','Edit','View']
+      4. 模糊：小寫 + 去空白後 target in word → conf 0.6
          例：target='File' 匹到 word='FILE.EXE'
     """
     t = target.strip()
@@ -139,30 +139,32 @@ def _find_target_in_words(words: list[dict], target: str) -> Optional[tuple[dict
         if wt and t in wt:
             return w, 0.9
 
-    # 3. 行層級子字串（跨詞）— 解決 CJK 被 OCR 拆字的常見情境
+    # 3. 跨詞匹配 — 把一行所有 word 拼起來（去空白）再比對，可抓到 CJK 被 OCR 拆字
     by_line: dict[int, list[dict]] = {}
     for w in words:
         by_line.setdefault(w["line_index"], []).append(w)
+    t_nospace = "".join(t.split())
     for idx, line_words in by_line.items():
-        line_text = line_words[0]["line_text"]
-        if t in line_text:
-            # 用整行的合併 bounding box 當點擊範圍（沒有 per-char offset 可精準定位）
+        # 忽略 line.text（可能 CJK 字間有空格），改用 word.text 直接拼接
+        joined_nospace = "".join(w["text"] for w in line_words).replace(" ", "")
+        if t_nospace and t_nospace in joined_nospace:
+            # 找出覆蓋目標起始位置的 words（保守：回整行合併 bbox）
             xs = [w["x"] for w in line_words]
             ys = [w["y"] for w in line_words]
             rights = [w["x"] + w["w"] for w in line_words]
             bots = [w["y"] + w["h"] for w in line_words]
             merged = {
-                "text": line_text,
+                "text": joined_nospace,
                 "x": min(xs),
                 "y": min(ys),
                 "w": max(rights) - min(xs),
                 "h": max(bots) - min(ys),
-                "line_text": line_text,
+                "line_text": joined_nospace,
                 "line_index": idx,
             }
             return merged, 0.8
 
-    # 4. 模糊（忽略大小寫 + 去空白；同樣單向：target 是 word 的子字）
+    # 4. 模糊（忽略大小寫 + 去空白；單向：target 是 word 的子字）
     t_norm = "".join(t.split()).lower()
     if t_norm:
         for w in words:
@@ -230,11 +232,19 @@ def find_text_on_screen(
 
     hit = _find_target_in_words(words, target)
     if hit is None:
-        # Debug 用：把 OCR 讀到的前 10 個詞印出來，方便使用者診斷
-        sample = ", ".join(f"'{w['text']}'" for w in words[:10])
+        # Debug：印出前幾行「拼起來」的內容（去空白），比列單詞更好判斷
+        # （OCR 對 CJK 會把每個字拆成獨立 word，看單詞看不出文字結構）
+        by_line: dict[int, list[dict]] = {}
+        for w in words:
+            by_line.setdefault(w["line_index"], []).append(w)
+        line_samples = []
+        for idx in sorted(by_line.keys())[:6]:
+            joined = "".join(w["text"] for w in by_line[idx]).replace(" ", "")
+            if joined:
+                line_samples.append(f"'{joined[:40]}'")
         return OcrMatch(
             False,
-            reason=f"OCR 沒找到 '{target}'（讀到 {len(words)} 個詞，前幾個：{sample}）",
+            reason=f"OCR 沒找到 '{target}'（讀到 {len(words)} 個詞 / {len(by_line)} 行，前幾行：{', '.join(line_samples)}）",
             ocr_words_count=len(words),
         )
 
