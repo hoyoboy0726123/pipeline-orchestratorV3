@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -23,6 +24,48 @@ import numpy as np
 
 # ── Emergency abort signal（執行中可從外部 set，立即中斷）────────
 _abort_flags: dict[str, bool] = {}
+
+
+# ── 模板圖 LRU 快取 ───────────────────────────────────────────────
+# 對同一張錨點圖反覆 read_bytes + imdecode + cvtColor + Canny 是浪費；
+# 典型一個 step 會對同一圖做 2~14 次（multi-scale × edge fallback × retry）。
+# 以 (abs_path, mtime) 當 key，mtime 變動（使用者重錄）會自動失效。
+# 記憶體成本：每個 ~5-50KB，上限 64 張 → < 4MB
+_TPL_CACHE_MAX = 64
+_tpl_cache: "OrderedDict[tuple[str, float], tuple[np.ndarray, np.ndarray]]" = OrderedDict()
+
+
+def _load_template(tpl_path: Path):
+    """解碼錨點圖 → 回傳 (gray, edge) 灰階/Canny 邊緣陣列，兩者皆用於 find_template 的 mode 切換。
+    命中快取直接回；未命中解碼一次存入。失敗回 (None, None, 錯誤訊息)。"""
+    import cv2
+    try:
+        mtime = tpl_path.stat().st_mtime
+    except OSError as e:
+        return None, None, f"模板 stat 失敗：{e}"
+    key = (str(tpl_path), mtime)
+    cached = _tpl_cache.get(key)
+    if cached is not None:
+        _tpl_cache.move_to_end(key)
+        return cached[0], cached[1], ""
+    try:
+        buf = np.frombuffer(tpl_path.read_bytes(), dtype=np.uint8)
+        tpl_color = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    except Exception as e:
+        return None, None, f"模板讀取例外：{e}"
+    if tpl_color is None:
+        return None, None, f"模板解碼失敗（格式錯誤？）：{tpl_path}"
+    tpl_gray = cv2.cvtColor(tpl_color, cv2.COLOR_BGR2GRAY)
+    tpl_edge = cv2.Canny(tpl_gray, 50, 150)
+    _tpl_cache[key] = (tpl_gray, tpl_edge)
+    while len(_tpl_cache) > _TPL_CACHE_MAX:
+        _tpl_cache.popitem(last=False)
+    return tpl_gray, tpl_edge, ""
+
+
+def clear_template_cache() -> None:
+    """測試或使用者重錄大量錨點後手動清快取用"""
+    _tpl_cache.clear()
 
 
 def request_abort(run_id: str) -> None:
@@ -117,23 +160,18 @@ def find_template(
     if not tpl_path.is_file():
         return MatchResult(False, reason=f"模板不存在：{template_path}")
 
-    # Windows 上 cv2.imread 對中文路徑會失敗，改讀 bytes 再 imdecode
-    try:
-        buf = np.frombuffer(tpl_path.read_bytes(), dtype=np.uint8)
-        tpl_color = cv2.imdecode(buf, cv2.IMREAD_COLOR)
-    except Exception as e:
-        return MatchResult(False, reason=f"模板讀取例外：{e}")
-    if tpl_color is None:
-        return MatchResult(False, reason=f"模板解碼失敗（格式錯誤？）：{template_path}")
-    tpl_gray = cv2.cvtColor(tpl_color, cv2.COLOR_BGR2GRAY)
+    # 從 LRU 快取拿灰階 + Canny 邊緣，避免每次呼叫都重做 decode+cvtColor+Canny
+    tpl_gray, tpl_edge, err = _load_template(tpl_path)
+    if err:
+        return MatchResult(False, reason=err)
 
     screen_color, origin_x, origin_y = _capture_screen()
     screen_gray_full = cv2.cvtColor(screen_color, cv2.COLOR_BGR2GRAY)
 
-    # Edge 模式：兩張圖都先跑 Canny 保留輪廓，對 hover fade / 主題色變化等差異更容忍
+    # Edge 模式：template 在 _load_template 已預算好 Canny；螢幕每次都要重算（畫面會變）。
     # 閾值 50/150 是常用的 hysteresis 組合，對 UI 元素邊緣偵測穩定
     if mode == "edge":
-        tpl_proc_full = cv2.Canny(tpl_gray, 50, 150)
+        tpl_proc_full = tpl_edge
         screen_proc_full = cv2.Canny(screen_gray_full, 50, 150)
     else:
         tpl_proc_full = tpl_gray
@@ -698,6 +736,23 @@ class StepResult:
 MAX_ACTIONS_PER_STEP = 500  # 單步動作數上限，防止失控腳本無限循環
 
 
+def validate_action_assets(actions: list[dict], assets_dir: Path) -> list[str]:
+    """Preflight：掃一遍 actions 裡引用到的所有錨點圖是否存在。
+    提早 FAIL 比回放跑到一半才發現圖不見好太多，也讓使用者錯誤訊息更集中。
+    回傳缺失檔名 list（保留順序、去重）。"""
+    missing: list[str] = []
+    seen: set[str] = set()
+    for a in actions:
+        for key in ("image", "image2"):
+            name = a.get(key) or ""
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            if not (assets_dir / name).is_file():
+                missing.append(name)
+    return missing
+
+
 def _screen_layout_match(meta_path: Path, logger: logging.Logger) -> bool:
     """比對錄製時與回放時的螢幕解析度。
     True = 一致（絕對座標 fallback 仍可靠）；False = 已改變（座標 fallback 不可信，應禁用）"""
@@ -765,6 +820,21 @@ def execute_computer_use_step(
     if not assets.is_dir():
         # 沒有 assets 目錄也可能 OK（例如只有 type_text / wait），不直接失敗
         logger.warning(f"[computer_use] assets 目錄不存在：{assets_dir}")
+    else:
+        # 錨點圖 preflight：避免跑到一半才發現圖不見
+        missing_imgs = validate_action_assets(actions, assets)
+        if missing_imgs:
+            preview = ", ".join(missing_imgs[:5])
+            more = f"...（共 {len(missing_imgs)} 張）" if len(missing_imgs) > 5 else ""
+            return StepResult(
+                success=False,
+                total_actions=len(actions),
+                succeeded=0,
+                failed_at=0,
+                stdout="",
+                stderr=f"preflight 失敗：assets_dir 缺少錨點圖：{preview}{more}",
+                exit_code=2,
+            )
 
     # 螢幕解析度比對：若改變（接/拔外接螢幕）就禁用座標 fallback
     layout_ok = _screen_layout_match(assets / "meta.json", logger) if assets.is_dir() else True
