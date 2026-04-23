@@ -178,7 +178,7 @@ export default function ComputerUsePanel({ node, pipelineName, onUpdate, onClose
             </p>
           )}
           <p className="text-[11px] text-gray-500 leading-relaxed">
-            按下開始後切換到要自動化的應用操作即可。點擊會擷取周圍 80×80 的錨點圖（存在 <code className="font-mono text-purple-700">assets_dir</code> 中）。按 F9 或這個按鈕可停止。
+            按下開始後切換到要自動化的應用操作即可。點擊時會擷取周圍 240×80 的錨點 + 整個螢幕截圖（存在 <code className="font-mono text-purple-700">assets_dir</code> 中，日後可點「✏️ 編輯錨點」手動調整範圍）。按 F9 或這個按鈕可停止。
           </p>
         </div>
 
@@ -278,8 +278,8 @@ export default function ComputerUsePanel({ node, pipelineName, onUpdate, onClose
                         <div className="mt-1 flex items-center gap-1.5">
                           <label className="flex items-center gap-1 shrink-0 cursor-pointer select-none"
                             title={ocrEnabled
-                              ? '已啟用 OCR 文字比對；OCR 為主要方法（取代 CV）。失敗是否退回 CV/座標 請看節點的 OCR/CV 比對設定'
-                              : '勾選啟用 Windows OCR 文字比對。取消時保留文字供下次使用'}>
+                              ? '已啟用 OCR 文字比對；OCR 為主要方法（取代 CV）。預設失敗直接 FAIL（不退 CV），需在下方「OCR 比對設定」手動開啟 ocr_cv_fallback 才會退回 CV'
+                              : '勾選啟用 Windows OCR 文字比對。需搭配右側輸入目標文字；取消時保留文字供下次使用'}>
                             <input
                               type="checkbox"
                               checked={ocrEnabled}
@@ -568,6 +568,9 @@ export default function ComputerUsePanel({ node, pipelineName, onUpdate, onClose
             <label className="text-xs font-semibold text-gray-500 uppercase tracking-wide block mb-1.5">重試次數</label>
             <input type="number" value={data.retry}
               onChange={e => onUpdate({ retry: parseInt(e.target.value) || 0 })} className={inputCls} />
+            <p className="text-[10px] text-gray-500 mt-1 leading-relaxed">
+              預設 0：桌面自動化重試會從動作 #1 重頭跑一遍，可能重複點擊、造成副作用（例如重複送單）。建議 0；確定所有動作 idempotent 才調大
+            </p>
           </div>
         </div>
 

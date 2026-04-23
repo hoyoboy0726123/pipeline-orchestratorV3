@@ -66,7 +66,7 @@ function buildWelcomeMessage(env: EnvPaths): string {
 第二步（AI 技能）：讀取上一步的 Excel，按「部門」加總 Amount，產出一份欄位為「Department, TotalAmount, TransactionCount」的摘要 Excel：\`ai_output/demo_review/summary.xlsx\`
 第三步（人工確認）：暫停並透過 Telegram 通知我檢查摘要表，確認後才完成`
   } else {
-    ex3 = `**範例 3（三種節點組合）**
+    ex3 = `**範例 3（Python + AI + 人工確認 組合）**
 第一步（Python 腳本）：執行你的腳本，產出 \`ai_output/demo_review/raw.xlsx\`
 第二步（AI 技能）：讀取上一步做簡易統計，輸出 \`ai_output/demo_review/summary.xlsx\`
 第三步（人工確認）：暫停並透過 Telegram 通知我檢查摘要表`

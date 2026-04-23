@@ -56,7 +56,7 @@ export default function HumanConfirmPanel({ node, onUpdate, onClose, onDelete }:
             <div className="text-sm font-medium text-gray-700">📱 Telegram 通知</div>
             <p className="text-xs text-gray-400 mt-0.5">
               {data.notifyTelegram
-                ? '已啟用：暫停時會透過 Telegram 發送摘要和確認按鈕'
+                ? '已啟用：暫停時送 Telegram 摘要 + 決策按鈕（繼續 / 中止 / 截圖 / 查看 Log；上一步若為 AI 技能節點還會多出「💬 補充指示」）'
                 : '已關閉：僅透過網頁 UI 等待確認'}
             </p>
           </div>
@@ -78,8 +78,8 @@ export default function HumanConfirmPanel({ node, onUpdate, onClose, onDelete }:
             <div className="text-sm font-medium text-gray-700">📸 自動截圖</div>
             <p className="text-xs text-gray-400 mt-0.5">
               {data.screenshot
-                ? '已啟用：暫停前自動截取螢幕畫面，附帶到 Telegram 通知'
-                : '已關閉：不截取螢幕畫面'}
+                ? '已啟用：暫停時每個螢幕各截一張（多螢幕分開傳），自動壓縮後發到 Telegram'
+                : '已關閉：Telegram 通知裡只有文字決策訊息，可手動按「📸 截圖」取得畫面'}
             </p>
           </div>
           <button
