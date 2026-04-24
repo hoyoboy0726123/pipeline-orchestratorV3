@@ -42,10 +42,11 @@ RUN pip install --no-cache-dir opencv-python-headless
 # python-pptx：Python 原生產 PPT；pdfplumber：PDF 文字抽取
 RUN pip install --no-cache-dir python-pptx pdfplumber
 
-# ── Tier 5：爬蟲進階（新聞 + Cloudflare 繞過 + RSS）──
+# ── Tier 5：爬蟲進階（新聞 + Cloudflare 繞過 + RSS + UA rotation）──
 # newspaper3k 會拉 nltk / tldextract / feedparser（~100MB）；cloudscraper 繞 CF 5s 挑戰
 # lxml_html_clean：lxml 5.x 後 html.clean 被拆成獨立套件，newspaper3k 需要
-RUN pip install --no-cache-dir newspaper3k cloudscraper feedparser lxml_html_clean
+# fake_useragent：隨機 User-Agent 避免網站封 bot（比自己寫 UA 表簡單）
+RUN pip install --no-cache-dir newspaper3k cloudscraper feedparser lxml_html_clean fake_useragent
 
 # ── Tier 6：Node.js runtime + pptxgenjs（JS 版 PPT 產生器）──
 # debian 12 預設 nodejs 是 v18，對 pptxgenjs 3.x 足夠用

@@ -33,10 +33,15 @@ ASK_USER_MAX = 3          # 一個 skill 節點最多 ask_user 次數（ask_mode
 ASK_USER_TIMEOUT = 3600   # 單次等待使用者回答的逾時（秒）
 
 # ── web_search 成本 / context 保護 ─────────────────────────────────────────
-WEB_SEARCH_MAX_PER_STEP = 5       # 單一 skill step 最多呼叫次數（每次 $0.01-0.025）
-WEB_SEARCH_OUTPUT_CHAR_CAP = 2000 # 回傳給 agent 的硬上限，超過截斷（保護 LLM context）
-WEB_SEARCH_TIER2_SNIPPET_CHARS = 120  # Tier 2 (include_snippets) 每篇片段字元數
-WEB_SEARCH_TIER1_TITLE_CHARS = 100    # Tier 1 只顯示 title 的長度
+# 兩段式設計（簡化自原本的 3-tier）：
+#   OFF：輕量 — answer + URL 清單（~500 字）
+#   ON： 完整 — answer + URL + 每則文章完整原文（~15000 字）
+#        由 Tavily 端直接回完整內容（include_raw_content=True），Agent 不用自己寫爬蟲
+WEB_SEARCH_MAX_PER_STEP = 5             # 單一 skill step 最多呼叫次數
+WEB_SEARCH_OUTPUT_CHAR_CAP_LIGHT = 2000 # OFF 模式：輕量硬上限
+WEB_SEARCH_OUTPUT_CHAR_CAP_FULL = 20000 # ON 模式：完整內容硬上限（雲端 context 足夠）
+WEB_SEARCH_PER_RESULT_FULL_CHARS = 3000 # ON 模式：每則原文截斷長度
+WEB_SEARCH_TITLE_CHARS = 100            # Title 顯示最大長度
 
 
 # ── ask_user 進行中的問題：run_id -> {question, options, context, event, answer} ──
@@ -538,12 +543,11 @@ def _skill_read_file(path: str, max_lines: int = 100) -> str:
 
 def _skill_web_search(tool_input: str, call_count: int = 0,
                       logger: Optional[logging.Logger] = None) -> str:
-    """用 Tavily API 搜網。回傳 LLM-friendly 文字。
-    分層輸出避免塞爆 LLM context：
-      Tier 1（預設）= Tavily 的 `answer` + URL 清單（~300-600 字元）
-      Tier 2（需 agent 在 input 帶 include_snippets=true）= 加 ~120 字/篇片段（~1000-1500 字元）
-      完整內容請 agent 自己 requests.get(url) 抓，不走本工具
-    無論如何最後截斷到 WEB_SEARCH_OUTPUT_CHAR_CAP（2000 字元）避免爆炸。
+    """用 Tavily API 搜網。兩段式輸出：
+      OFF（include_full_content=false）= answer + URL 清單（~500 字元）
+      ON （include_full_content=true ）= answer + URL + 每則完整原文（~15000 字元）
+    ON 模式由 Tavily 端直接回完整文章內容（include_raw_content=True），
+    Agent 不用自己寫 requests.get / newspaper 爬蟲（省失敗率）。
     """
     _lg = logger if logger is not None else log
     # ── 1. 設定檢查 ──
@@ -580,8 +584,9 @@ def _skill_web_search(tool_input: str, call_count: int = 0,
         return "[web_search 錯誤] query 不可為空"
     max_results = max(1, min(int(params.get("max_results", 5)), 5))
     search_depth = "advanced" if str(params.get("search_depth", "basic")).lower() == "advanced" else "basic"
-    tier2 = bool(params.get("include_snippets",
-                            s.get("web_search_verbose_default", False)))
+    # 完整內容模式：預設從 settings 取、agent 可 per-call 覆寫
+    full_content = bool(params.get("include_full_content",
+                                   s.get("web_search_full_content_default", False)))
     # ── 4. 呼叫 Tavily ──
     import requests as _requests
     try:
@@ -593,9 +598,11 @@ def _skill_web_search(tool_input: str, call_count: int = 0,
                 "max_results": max_results,
                 "search_depth": search_depth,
                 "include_answer": True,
-                "include_raw_content": False,  # raw_content 可到 10KB，絕對不要
+                # ON 模式：讓 Tavily 回完整文章原文（他們處理 CF / JS 渲染等）
+                # OFF 模式：不要原文，輕量模式節省 context
+                "include_raw_content": full_content,
             },
-            timeout=20,
+            timeout=45 if full_content else 20,  # full content 回傳較慢，給長一點 timeout
         )
         if resp.status_code == 401:
             return "[web_search 錯誤] Tavily API key 無效（401）"
@@ -604,7 +611,7 @@ def _skill_web_search(tool_input: str, call_count: int = 0,
         resp.raise_for_status()
         data = resp.json()
     except _requests.Timeout:
-        return "[web_search 錯誤] Tavily 連線逾時（>20s）"
+        return "[web_search 錯誤] Tavily 連線逾時"
     except _requests.HTTPError as e:
         return f"[web_search 錯誤] Tavily HTTP {resp.status_code}：{resp.text[:300]}"
     except Exception as e:
@@ -612,29 +619,36 @@ def _skill_web_search(tool_input: str, call_count: int = 0,
     # ── 5. 組裝輸出 ──
     answer = (data.get("answer") or "").strip()
     results = data.get("results") or []
-    lines = [f"[web_search] query=\"{query[:80]}\" (depth={search_depth}, tier={'2' if tier2 else '1'})"]
+    mode_tag = "full" if full_content else "light"
+    lines = [f"[web_search] query=\"{query[:80]}\" (depth={search_depth}, mode={mode_tag})"]
     if answer:
         lines.append(f"answer: {answer}")
     lines.append("")
     lines.append(f"來源 (共 {len(results)} 項)：")
     for i, r in enumerate(results, start=1):
-        title = (r.get("title") or "").strip()[:WEB_SEARCH_TIER1_TITLE_CHARS]
+        title = (r.get("title") or "").strip()[:WEB_SEARCH_TITLE_CHARS]
         url = (r.get("url") or "").strip()
         lines.append(f"[{i}] {title} — {url}")
-        if tier2:
-            snippet = (r.get("content") or "").strip().replace("\n", " ")
-            if snippet:
-                if len(snippet) > WEB_SEARCH_TIER2_SNIPPET_CHARS:
-                    snippet = snippet[:WEB_SEARCH_TIER2_SNIPPET_CHARS] + "…"
-                lines.append(f"    {snippet}")
+        if full_content:
+            # include_raw_content 會回 raw_content；回 None 時退到 content（短摘要）
+            raw = (r.get("raw_content") or r.get("content") or "").strip()
+            if raw:
+                # 正規化換行空白，避免 agent 吃到一堆 \n\n\n
+                raw = re.sub(r"\n{3,}", "\n\n", raw)
+                if len(raw) > WEB_SEARCH_PER_RESULT_FULL_CHARS:
+                    raw = raw[:WEB_SEARCH_PER_RESULT_FULL_CHARS] + "…（本篇截斷）"
+                lines.append("--- 內文 ---")
+                lines.append(raw)
+                lines.append("--- /內文 ---")
     output = "\n".join(lines)
+    cap = WEB_SEARCH_OUTPUT_CHAR_CAP_FULL if full_content else WEB_SEARCH_OUTPUT_CHAR_CAP_LIGHT
     truncated = False
-    if len(output) > WEB_SEARCH_OUTPUT_CHAR_CAP:
-        output = output[:WEB_SEARCH_OUTPUT_CHAR_CAP] + f"\n…（已截斷，完整 {len(output)} 字；需詳細內容請 requests.get(URL)）"
+    if len(output) > cap:
+        output = output[:cap] + f"\n…（總輸出已截斷，完整 {len(output)} 字；下次縮小 max_results 或關閉 include_full_content）"
         truncated = True
     _lg.info(
         f"[web_search] query={query[:60]!r} → 回傳 {len(output)} 字元 "
-        f"(tier={'2' if tier2 else '1'}, depth={search_depth}, results={len(results)}"
+        f"(mode={mode_tag}, depth={search_depth}, results={len(results)}"
         f"{', truncated' if truncated else ''})"
     )
     return output
@@ -1321,19 +1335,32 @@ async def execute_step_with_skill(
 
 用法：<tool>web_search</tool>
 <input>{
-  "query": "台股2024年Q1電子股漲幅",
-  "max_results": 5,           # 1-5；預設 5
-  "search_depth": "basic",    # "basic"（預設，便宜）或 "advanced"（貴 2x，結果更精緻）
-  "include_snippets": false   # Tier 1→Tier 2 開關；見下面
+  "query": "今天美國科技新聞",
+  "max_results": 5,               # 1-5；預設 5
+  "search_depth": "basic",        # "basic"（預設便宜）或 "advanced"（貴 2x 結果更精）
+  "include_full_content": true    # 開啟 = 一次拿到每則完整文章原文（~3000 字/篇），見下面
 }</input>
 
-回傳分層（控 LLM context 不爆炸）：
-- Tier 1（預設）= Tavily 的 `answer` 摘要 + URL 清單（~300-600 字元）
-- Tier 2（include_snippets=true）= 加每篇 ~120 字片段（~1000-1500 字元）
-- 完整內容：**不要用 web_search 拉**；用 run_python + requests.get(URL) 自己抓需要的那一頁
+兩段式輸出：
+- **關閉 include_full_content（輕量）** = Tavily 的 `answer` 摘要 + URL 清單（~500 字）
+  適合：只要結論、只要知道有哪些來源
+- **開啟 include_full_content（完整）** = answer + URL + 每則文章完整原文（~15000 字）
+  適合：要擷取新聞內文、翻譯、深度摘要、比對多篇
 
-⚠️ 本地小 context 模型（Ollama 8B）務必用 Tier 1，必要時才升 Tier 2。
-⚠️ 每個步驟最多搜 5 次（每次 $0.01-0.025 USD），請整合後再下一次 query。"""
+⭐ **強烈建議：任務要「擷取內文 / 複製內容 / 分析全文」時直接開 `include_full_content=true`**，
+   不要另外寫 requests.get / newspaper 爬蟲。Tavily 已經處理 Cloudflare / JS 渲染等反爬機制，
+   你自己爬常常 403 / 空內容；直接用 Tavily 拉成功率高很多。
+   使用者開啟本工具時就意識到「需要雲端大 context」，所以不用擔心 token 爆。
+
+實例對照：
+  任務：「抓 5 則美國科技新聞，包含標題與完整內文，存成 CSV」
+    ✅ **正確**：web_search query="latest US tech news" include_full_content=true
+       → 一次拿回 5 則完整文章 → run_python 把資料寫成 CSV（只用 csv 模組，不碰爬蟲）
+    ❌ **錯誤**：web_search 拿 URL → 寫 `newspaper.build('reuters.com')` 自己爬
+       （幾乎一定失敗：CF 擋、anti-bot、動態渲染）
+
+⚠️ 每個步驟最多搜 5 次（每次 $0.01-0.025 USD），請整合後再下一次 query。
+⚠️ include_full_content=true 會讓回傳達 15000 字以上，只在任務確實需要時才開。"""
             logger.info(f"[{step_name}] 🔍 web_search 工具已啟用（Tavily）")
     except Exception as _e:
         logger.debug(f"[{step_name}] web_search 工具注入失敗（略過）：{_e}")
@@ -1775,8 +1802,43 @@ async def execute_step_with_skill(
                     )
                 ))
 
-            # 2) 連續 3 次任何形式失敗 → 直接 bail out，不要耗完 15 次 iteration
+            # 2) 連續 3 次任何形式失敗 → 提早中止（但 ask_mode ON 時改成問使用者）
             if consecutive_failures >= 3:
+                # ask_mode ON：使用者表態願意被問 → 不要直接 bail，問一下再決定
+                # 這修掉實測痛點：ask_mode 勾了、但 agent 從沒 ask 就被早停中止了
+                if ask_mode:
+                    logger.info(f"[{step_name}] 連續失敗 {consecutive_failures} 次，詢問模式啟用 → 主動問使用者如何繼續")
+                    _err_tail = tool_result[-400:] if tool_result else "（無）"
+                    answer = await _wait_for_ask_user(
+                        run_id=run_id,
+                        question=(
+                            f"⚠️ Skill agent 連續失敗 {consecutive_failures} 次。\n\n"
+                            f"最後一次錯誤：{_err_tail}\n\n"
+                            "該如何繼續？"
+                        ),
+                        options=["繼續嘗試（換策略）", "放棄此步驟"],
+                        context="若選『繼續』可在自由輸入補充策略提示，例如「改用 Selenium」「先試 RSS feed」。",
+                        logger=logger, step_name=step_name,
+                    )
+                    if answer is None or "放棄" in answer:
+                        logger.info(f"[{step_name}] 使用者選擇放棄（或 ask_user 逾時）")
+                        return ExecResult(
+                            exit_code=1,
+                            stdout="\n".join(all_stdout),
+                            stderr=f"使用者選擇放棄此步驟（連續失敗 {consecutive_failures} 次後）",
+                            pending_recipe=_pending_recipe,
+                            missing_packages=None,
+                        )
+                    # 使用者選擇繼續：把 answer 當額外提示注入對話
+                    consecutive_failures = 0  # 重置計數器讓 agent 繼續
+                    was_interactive = True
+                    messages.append(HumanMessage(
+                        content=f"[使用者補充指示] {answer}\n\n"
+                                "請根據以上指示調整策略、不要重複之前失敗的做法。"
+                    ))
+                    logger.info(f"[{step_name}] 使用者同意繼續，指示：{answer[:100]}")
+                    continue  # 回到迭代頂端，不要走下面的 consecutive_failures bail-out
+                # ask_mode OFF：照舊行為，直接中止
                 logger.error(f"[{step_name}] ⛔ 連續失敗 {consecutive_failures} 次，提早中止避免浪費 token")
                 return ExecResult(
                     exit_code=1,

@@ -151,7 +151,7 @@ fi
 echo "==> 冒煙測試 — 進階套件（Tier 4-5）："
 $DOCKER exec "$CONTAINER" python -c "
 missing = []
-for name in ['pptx', 'pdfplumber', 'newspaper', 'cloudscraper', 'feedparser']:
+for name in ['pptx', 'pdfplumber', 'newspaper', 'cloudscraper', 'feedparser', 'fake_useragent']:
     try:
         __import__(name)
     except Exception as e:
@@ -160,7 +160,7 @@ if missing:
     print('  ⚠ 缺少：', ', '.join(missing))
     print('    解法：setup_sandbox.bat --rebuild 重建')
 else:
-    print('  ✓ python-pptx / pdfplumber / newspaper3k / cloudscraper / feedparser 全部 OK')
+    print('  ✓ python-pptx / pdfplumber / newspaper3k / cloudscraper / feedparser / fake_useragent 全部 OK')
 " || true
 
 echo "==> 冒煙測試 — Node.js + pptxgenjs："

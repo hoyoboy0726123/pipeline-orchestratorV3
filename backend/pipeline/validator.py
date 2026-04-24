@@ -411,6 +411,14 @@ def _run_python_sync(code: str) -> str:
         "    print('[info] read_file() is a tool, not a Python function - ignored')\n"
     )
     code = preamble + code
+    # wsl_docker 模式：路由到沙盒；沙盒不可用 / host 模式時 fallback 到下面 subprocess
+    try:
+        from pipeline.executor import _try_sandbox_exec
+        sandbox_out = _try_sandbox_exec("run_python", code, None, "", None)
+        if sandbox_out is not None:
+            return sandbox_out
+    except Exception:
+        pass  # 沙盒模組壞了也 fallback 到 host subprocess
     try:
         # UTF-8 寫檔（見 executor.py 同樣 fix 的註解）
         with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8') as f:
@@ -443,10 +451,21 @@ def _run_python_sync(code: str) -> str:
 
 
 def _run_shell_sync(cmd: str) -> str:
-    """執行 shell 命令，回傳輸出。會過濾危險命令。"""
+    """執行 shell 命令，回傳輸出。會過濾危險命令。
+    wsl_docker 模式下透過 executor._try_sandbox_exec 路由到容器；
+    否則走 host subprocess（原行為）。
+    """
     first_word = cmd.strip().split()[0] if cmd.strip() else ""
     if first_word in _DANGEROUS_COMMANDS:
         return f"[拒絕] 命令 '{first_word}' 被安全策略封鎖"
+    # 先試沙盒（如果 settings.skill_sandbox_mode='wsl_docker'）
+    try:
+        from pipeline.executor import _try_sandbox_exec
+        sandbox_out = _try_sandbox_exec("run_shell", cmd, None, "", None)
+        if sandbox_out is not None:
+            return sandbox_out
+    except Exception:
+        pass  # 沙盒模組問題 → 繼續走 host fallback
     # 統一 python interpreter（與 executor._skill_run_shell 一致）
     from pipeline.executor import _rewrite_python_cmd
     cmd = _rewrite_python_cmd(cmd)
