@@ -26,6 +26,12 @@ _DEFAULT = {
     #   "host"       — Windows 原生 subprocess（快、跟 V2 一樣）
     #   "wsl_docker" — 透過 WSL 內的 pipeline-sandbox 容器執行（隔離、需先跑 sandbox/setup_sandbox.bat）
     "skill_sandbox_mode": "host",
+    # 網路搜尋（Tavily）：skill agent 需要即時 / 外部資訊時使用
+    # key 可先填但預設關閉，避免誤觸扣費
+    "tavily_api_key": "",
+    "web_search_enabled": False,
+    # 雲端模型 context 大可預設 Tier 2；本地 Ollama 保持 False（只給 answer + URL，~300 字）
+    "web_search_verbose_default": False,
 }
 
 _cache: Optional[dict] = None
