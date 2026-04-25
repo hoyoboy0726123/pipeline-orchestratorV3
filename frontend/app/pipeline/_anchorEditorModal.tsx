@@ -647,11 +647,15 @@ export default function AnchorEditorModal({ action, actionIndex, assetsDir, defa
                 </div>
 
                 <div className="p-2 bg-gray-50 rounded-lg text-xs text-gray-600 leading-relaxed space-y-1.5">
-                  <div className="font-semibold text-gray-700">🔤 OCR 運作流程</div>
-                  <div>1️⃣ 擷取藍框內的螢幕影像</div>
-                  <div>2️⃣ Windows OCR 讀出文字 → 比對 <code className="px-1 bg-white rounded font-mono">ocr_text</code></div>
-                  <div>3️⃣ 找到 → 點文字中心（<b>忽略紅十字座標</b>，適合位置會跑的目標）</div>
-                  <div>4️⃣ 找不到 → 依 ocr_cv_fallback 決定 FAIL 或退回 CV 錨點比對</div>
+                  <div className="font-semibold text-gray-700">🔤 OCR 三階段搜尋</div>
+                  <div>1️⃣ <b>框內</b> 找 <code className="px-1 bg-white rounded font-mono">ocr_text</code>（速度快、避開跨螢幕誤判）</div>
+                  <div>2️⃣ 框內沒找到 → <b>錄製座標附近 ±400px</b> 再試一次</div>
+                  <div>3️⃣ 還是沒找到 → <b>整個螢幕</b> 最後保險再試一次</div>
+                  <div>4️⃣ 找到 → 點文字中心（<b>忽略紅十字座標</b>）</div>
+                  <div>5️⃣ 三階段都失敗 → 依 ocr_cv_fallback 決定 FAIL 或退回 CV 錨點</div>
+                  <div className="text-gray-500 pt-1 mt-1 border-t border-gray-200">
+                    👉 框是「優先位置」不是「強制位置」。畫面飄位（開始選單、動態 UI）也能找到
+                  </div>
                 </div>
 
                 <div className="p-2 bg-gray-50 rounded-lg text-xs text-gray-600 space-y-1">
