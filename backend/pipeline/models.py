@@ -86,6 +86,9 @@ class ComputerUseAction(BaseModel):
     ocr_box_top: int = 0
     ocr_box_width: int = 0
     ocr_box_height: int = 0
+    # 嚴格鎖定範圍：True = 框內找不到立即 fail（不退附近、不退全螢幕）
+    # 用於「目標必須在固定位置才合法」的場景。預設 False = 寬容三階段 fallback
+    ocr_strict_region: bool = False
 
 
 class PipelineStep(BaseModel):

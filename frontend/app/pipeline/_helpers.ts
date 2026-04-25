@@ -106,6 +106,8 @@ export interface ComputerUseAction {
   ocr_box_top?: number
   ocr_box_width?: number
   ocr_box_height?: number
+  // 嚴格鎖定範圍：true = 框內找不到立即 fail（不退附近、不退全螢幕）
+  ocr_strict_region?: boolean
   anchor_off_x?: number // 點擊相對錨點影像中心的偏移 x
   anchor_off_y?: number // 點擊相對錨點影像中心的偏移 y
   full_image?: string   // 全螢幕截圖檔名（手動圈選編輯錨點時用）

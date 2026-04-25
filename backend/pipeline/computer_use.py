@@ -351,6 +351,7 @@ def execute_action(
                         near_xy=near, search_radius=cv_search_radius,
                         threshold=ocr_threshold,
                         region=ocr_region,
+                        strict_region=bool(action.get("ocr_strict_region", False)),
                     )
                     if ocr_res.found:
                         _do_click(pg, ocr_res.center[0], ocr_res.center[1],

@@ -44,6 +44,8 @@ export default function AnchorEditorModal({ action, actionIndex, assetsDir, defa
     height: 80,
   }))
 
+  // 嚴格鎖定範圍：true = 框內找不到立即 fail，跳過附近/全螢幕 fallback
+  const [strictRegion, setStrictRegion] = useState<boolean>(action.ocr_strict_region === true)
   // 藍框：OCR 搜尋範圍（虛擬桌面絕對座標）
   // 有存 ocr_box_* 就用存的；沒存就以點擊位置為中心、半徑用 searchRadius（預設 400）
   const [ocrBox, setOcrBox] = useState(() => {
@@ -398,10 +400,11 @@ export default function AnchorEditorModal({ action, actionIndex, assetsDir, defa
         ocr_box_top: ocrBox.top,
         ocr_box_width: ocrBox.width,
         ocr_box_height: ocrBox.height,
+        ocr_strict_region: strictRegion,
         // 套用藍框 = 明確想走 OCR；自動勾 use_ocr，避免使用者忘記勾 checkbox
         use_ocr: true,
-      })
-      toast.success(`OCR 搜尋範圍已更新（${ocrBox.width}×${ocrBox.height}）`)
+      } as any)
+      toast.success(`OCR 搜尋範圍已更新（${ocrBox.width}×${ocrBox.height}${strictRegion ? '・嚴格鎖定' : ''}）`)
       onClose()
       return
     }
@@ -648,15 +651,53 @@ export default function AnchorEditorModal({ action, actionIndex, assetsDir, defa
 
                 <div className="p-2 bg-gray-50 rounded-lg text-xs text-gray-600 leading-relaxed space-y-1.5">
                   <div className="font-semibold text-gray-700">🔤 OCR 三階段搜尋</div>
-                  <div>1️⃣ <b>框內</b> 找 <code className="px-1 bg-white rounded font-mono">ocr_text</code>（速度快、避開跨螢幕誤判）</div>
-                  <div>2️⃣ 框內沒找到 → <b>錄製座標附近 ±400px</b> 再試一次</div>
-                  <div>3️⃣ 還是沒找到 → <b>整個螢幕</b> 最後保險再試一次</div>
-                  <div>4️⃣ 找到 → 點文字中心（<b>忽略紅十字座標</b>）</div>
-                  <div>5️⃣ 三階段都失敗 → 依 ocr_cv_fallback 決定 FAIL 或退回 CV 錨點</div>
-                  <div className="text-gray-500 pt-1 mt-1 border-t border-gray-200">
-                    👉 框是「優先位置」不是「強制位置」。畫面飄位（開始選單、動態 UI）也能找到
-                  </div>
+                  {strictRegion ? (
+                    <>
+                      <div className="text-orange-700 font-medium">⛔ 嚴格鎖定模式：只跑 Phase 1，框內找不到立即 FAIL</div>
+                      <div className="text-gray-400 line-through">2️⃣ 附近 ±400px（已 skip）</div>
+                      <div className="text-gray-400 line-through">3️⃣ 整個螢幕（已 skip）</div>
+                    </>
+                  ) : (
+                    <>
+                      <div>1️⃣ <b>框內</b> 找 <code className="px-1 bg-white rounded font-mono">ocr_text</code>（速度快、避開跨螢幕誤判）</div>
+                      <div>2️⃣ 框內沒找到 → <b>錄製座標附近 ±400px</b> 再試一次</div>
+                      <div>3️⃣ 還是沒找到 → <b>整個螢幕</b> 最後保險再試一次</div>
+                      <div>4️⃣ 找到 → 點文字中心（<b>忽略紅十字座標</b>）</div>
+                      <div>5️⃣ 三階段都失敗 → 依 ocr_cv_fallback 決定 FAIL 或退回 CV 錨點</div>
+                      <div className="text-gray-500 pt-1 mt-1 border-t border-gray-200">
+                        👉 框是「優先位置」不是「強制位置」。畫面飄位（開始選單、動態 UI）也能找到
+                      </div>
+                    </>
+                  )}
                 </div>
+
+                {/* 嚴格鎖定範圍 toggle：適合「目標必須在固定位置才合法」的場景 */}
+                <label className={`flex items-start gap-2 p-2 rounded-lg cursor-pointer border transition-colors ${
+                  strictRegion ? 'bg-orange-50 border-orange-300' : 'bg-white border-gray-200 hover:border-orange-300'
+                }`}>
+                  <input
+                    type="checkbox"
+                    checked={strictRegion}
+                    onChange={e => setStrictRegion(e.target.checked)}
+                    className="mt-0.5 w-4 h-4 accent-orange-600"
+                  />
+                  <div className="flex-1">
+                    <div className="text-xs font-medium text-gray-800">⛔ 嚴格鎖定範圍（找不到立即 fail）</div>
+                    <div className="text-[11px] text-gray-600 leading-relaxed mt-0.5">
+                      {strictRegion ? (
+                        <>
+                          <strong className="text-orange-700">已啟用</strong>：只認框內。Phase 2 附近、Phase 3 全螢幕、CV fallback 全部 skip。
+                          適合「目標必須在固定位置才合法」（例：通知必須在右下角、不能誤點其他地方同名元素）
+                        </>
+                      ) : (
+                        <>
+                          預設關。框是優先位置；找不到會擴大到附近 → 全螢幕。多數場景用這個。
+                          要鎖死位置避免誤點才需要勾起來
+                        </>
+                      )}
+                    </div>
+                  </div>
+                </label>
 
                 <div className="p-2 bg-gray-50 rounded-lg text-xs text-gray-600 space-y-1">
                   <div>🎯 紅十字 = 點擊座標 <span className="text-gray-400">(OCR 模式不使用)</span></div>
