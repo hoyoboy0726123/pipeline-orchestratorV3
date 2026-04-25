@@ -643,9 +643,15 @@ def _view_image_sync(path: str) -> dict:
     回傳 {"text": 描述, "image_b64": str|None, "image_mime": str|None}
     """
     try:
-        p = Path(path.strip().strip('"').strip("'")).expanduser()
+        cleaned = path.strip().strip('"').strip("'")
+        # 沙盒路徑 → Windows 路徑（修 V3 view_image bug：LLM 跑沙盒給 /mnt/c/... 結果讀不到）
+        import re as _re
+        m = _re.match(r"^/mnt/([a-z])/(.*)$", cleaned)
+        if m:
+            cleaned = f"{m.group(1).upper()}:\\{m.group(2).replace('/', chr(92))}"
+        p = Path(cleaned).expanduser()
         if not p.exists():
-            return {"text": f"[錯誤] 圖片不存在：{path}", "image_b64": None, "image_mime": None}
+            return {"text": f"[錯誤] 圖片不存在：{path}（解析後：{p}）", "image_b64": None, "image_mime": None}
         ext = p.suffix.lower()
         if ext not in IMAGE_EXTS_SKILL:
             return {"text": f"[錯誤] 不支援的圖片格式：{ext}，支援 {list(IMAGE_EXTS_SKILL.keys())}", "image_b64": None, "image_mime": None}
