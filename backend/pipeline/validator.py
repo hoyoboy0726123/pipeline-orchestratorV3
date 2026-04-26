@@ -42,9 +42,17 @@ SKILL_COOLDOWN_SECONDS = 60
 
 @dataclass
 class ValidationResult:
-    status: str      # "ok" | "warning" | "failed"
+    status: str      # "ok" | "warning" | "failed" | "rate_limited"
     reason: str      # 中文說明
     suggestion: str  # LLM 建議的修復方向（failed 時才有意義）
+
+
+def _is_rate_limit_error(e: Exception) -> bool:
+    """偵測 LLM provider 的配額/速率錯誤。429 / RESOURCE_EXHAUSTED 都算。
+    用於避免「驗證失敗 → fallback 再叫 LLM → 又 429」的連環燒配額。"""
+    s = str(e)
+    return ("429" in s or "RESOURCE_EXHAUSTED" in s or "quota" in s.lower()
+            or "rate limit" in s.lower() or "rate_limit" in s.lower())
 
 
 _llm = None
@@ -339,6 +347,15 @@ Exit Code：{exit_code}
         return result
 
     except Exception as e:
+        # 429 / RESOURCE_EXHAUSTED：不退 fallback，直接回 rate_limited 給 runner，
+        # 避免下一條 fallback 路徑又叫一次 LLM 再燒一次配額
+        if _is_rate_limit_error(e):
+            logger.error(f"[{step_name}] LLM 配額/速率受限（429）— 不退 fallback 避免燒光配額：{str(e)[:200]}")
+            return ValidationResult(
+                status="rate_limited",
+                reason=f"LLM provider 配額用盡或速率受限（429）：{str(e)[:300]}",
+                suggestion="等配額重置（通常每分鐘 / 每天）或在 Settings 切換 provider（Groq / OpenRouter / Ollama 本地）",
+            )
         logger.error(f"[{step_name}] LLM 驗證失敗：{e}，退回 exit code 判斷")
         # Fallback：純 exit code 判斷
         if exit_code == 0:
@@ -903,6 +920,14 @@ Exit Code：{exit_code}
         )
 
     except Exception as e:
+        # 429 / RESOURCE_EXHAUSTED：直接回 rate_limited，不退 validate_step（會再 429 一次）
+        if _is_rate_limit_error(e):
+            logger.error(f"[{step_name}] Skill 驗證 LLM 配額/速率受限（429）— 不退一般驗證避免燒光配額：{str(e)[:200]}")
+            return ValidationResult(
+                status="rate_limited",
+                reason=f"LLM provider 配額用盡或速率受限（429）：{str(e)[:300]}",
+                suggestion="等配額重置或在 Settings 切換 provider（Groq / OpenRouter / Ollama 本地）",
+            )
         logger.error(f"[{step_name}] Skill 驗證失敗：{e}，退回一般驗證")
         # Fallback to standard validation
         return await validate_step(

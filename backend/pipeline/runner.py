@@ -978,8 +978,15 @@ async def run_pipeline(
                 exec_result.stderr = ""  # 清掉標記
 
             has_expect = step.output and step.output.get_expect()
+            # exit_code -429 = LLM 配額用盡（executor 標記），直接走 rate_limited 路徑、不再叫 validator（會再 429 一次）
+            if exec_result.exit_code == -429:
+                val = ValidationResult(
+                    status="rate_limited",
+                    reason=(exec_result.stderr or "LLM 配額用盡或速率受限（429）"),
+                    suggestion="等配額重置或在 Settings 切換 provider（Groq / OpenRouter / Ollama 本地）",
+                )
             # computer_use 節點：成敗已由 action 執行結果決定，不需 LLM 驗證
-            if step.computer_use:
+            elif step.computer_use:
                 _status = "ok" if exec_result.exit_code == 0 else "failed"
                 val = ValidationResult(
                     status=_status,
@@ -1044,6 +1051,21 @@ async def run_pipeline(
             else:
                 run.step_results.append(step_result)
             store.save(run)
+
+            # rate_limited（LLM provider 429）：立即暫停，不重試（重試只會再 429 燒配額）
+            # 跳到 awaiting_human，讓使用者決定等多久 / 切 provider / 中止
+            if val.status == "rate_limited":
+                logger.warning(f"步驟 {step_num} ⏸ LLM 配額用盡（429）— 暫停等使用者決策，不重試")
+                run.status = "awaiting_human"
+                run.awaiting_type = "rate_limited"
+                run.awaiting_message = (
+                    f"⚠ LLM provider 配額用盡或速率受限（429）\n\n"
+                    f"原因：{val.reason}\n\n"
+                    f"建議：{val.suggestion}\n\n"
+                    f"請選擇：等待重試 / 切換 provider 後重試 / 中止"
+                )
+                store.save(run)
+                return run.run_id
 
             if val.status == "ok":
                 logger.info(f"步驟 {step_num} ✅ 通過")
