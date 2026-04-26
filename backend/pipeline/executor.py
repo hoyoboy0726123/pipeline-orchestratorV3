@@ -513,9 +513,12 @@ def _skill_read_file(path: str, max_lines: int = 100) -> str:
         if m:
             cleaned = m.group(1)
         cleaned = cleaned.strip().strip('"').strip("'")
+        # 沙盒路徑 → Windows 路徑（同 view_image 修補）：LLM 在沙盒裡跑時會給 /mnt/c/...，
+        # 但 read_file 在 host 上跑、需要 Windows 路徑
+        cleaned = _wsl_to_windows_path(cleaned)
         p = Path(cleaned).expanduser()
         if not p.exists():
-            return f"[錯誤] 檔案不存在：{path}"
+            return f"[錯誤] 檔案不存在：{path}（解析後：{p}）"
         if p.is_dir():
             files = sorted(p.iterdir())[:30]
             listing = "\n".join(f"  {'📁' if f.is_dir() else '📄'} {f.name} ({f.stat().st_size:,} B)" for f in files)
@@ -1204,9 +1207,17 @@ async def execute_step_with_skill(
                 import time as _time
                 t0 = _time.time()
                 loop = asyncio.get_event_loop()
-                tool_result = await loop.run_in_executor(
-                    None, lambda: _skill_run_python(cached["code"], cwd=working_dir, run_id=run_id)
-                )
+                # Bug fix: 原本直呼叫 _skill_run_python（host subprocess）會把 /mnt/c/... 沙盒路徑
+                # 丟到 Windows 跑 → 找不到檔 → recipe 永遠 fail 重學。
+                # 改走 _try_sandbox_exec 先判斷沙盒可用性。
+                def _replay_recipe():
+                    sandbox_out = _try_sandbox_exec(
+                        "run_python", cached["code"], working_dir, run_id, logger
+                    )
+                    if sandbox_out is not None:
+                        return sandbox_out
+                    return _skill_run_python(cached["code"], cwd=working_dir, run_id=run_id)
+                tool_result = await loop.run_in_executor(None, _replay_recipe)
                 runtime = _time.time() - t0
                 # 成功條件：輸出檔存在（若有指定）且無 [exit code: X]
                 ok = "[exit code:" not in tool_result

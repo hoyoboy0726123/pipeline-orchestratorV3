@@ -497,9 +497,13 @@ def _read_file_sync(path: str, max_lines: int = 100) -> str:
         if m:
             cleaned = m.group(1)
         cleaned = cleaned.strip().strip('"').strip("'")
+        # 沙盒路徑 → Windows 路徑（同 _view_image_sync 同份補丁）
+        m_wsl = _re.match(r"^/mnt/([a-z])/(.*)$", cleaned)
+        if m_wsl:
+            cleaned = f"{m_wsl.group(1).upper()}:\\{m_wsl.group(2).replace('/', chr(92))}"
         p = Path(cleaned).expanduser()
         if not p.exists():
-            return f"[錯誤] 檔案不存在：{path}"
+            return f"[錯誤] 檔案不存在：{path}（解析後：{p}）"
         if p.is_dir():
             files = sorted(p.iterdir())[:30]
             listing = "\n".join(f"  {'📁' if f.is_dir() else '📄'} {f.name} ({f.stat().st_size:,} B)" for f in files)
