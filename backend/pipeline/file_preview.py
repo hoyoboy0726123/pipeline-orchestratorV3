@@ -50,23 +50,6 @@ def render_file_preview(file_path: str, out_dir: Optional[str] = None) -> list[s
     out.mkdir(parents=True, exist_ok=True)
     ext = p.suffix.lower().lstrip(".")
 
-    # 特殊判斷：xlsx 內有 chart object 時，B1（pandas → table-only PNG）會看不到圖表，
-    # 直接走 LibreOffice 把 Excel 算過再渲染（含 chart）才能讓 VLM / 預覽看到圖表內容
-    if ext in ("xlsx", "xlsm"):
-        try:
-            from openpyxl import load_workbook
-            wb = load_workbook(str(p), read_only=False, data_only=False)
-            has_chart = any(len(ws._charts) > 0 for ws in wb.worksheets if hasattr(ws, '_charts'))
-            wb.close()
-            if has_chart:
-                log.info(f"[preview] {p.name} 內含 chart object → 直接走 LibreOffice 渲染（含圖表）")
-                try:
-                    return _render_via_libreoffice(p, out)
-                except Exception as _e:
-                    log.warning(f"[preview] LibreOffice 渲染失敗（{_e}）；退回 B1 pandas 表格（圖表會看不到）")
-        except Exception as _e:
-            log.debug(f"[preview] 偵測 chart 失敗、走 B1：{_e}")
-
     # B1 路線：每種格式有對應 renderer
     try:
         if ext in ("png", "jpg", "jpeg", "gif", "webp", "bmp"):
