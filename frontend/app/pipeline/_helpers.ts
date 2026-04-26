@@ -23,7 +23,7 @@ export interface StepData extends Record<string, unknown> {
   computerUseActions?: ComputerUseAction[]  // optional — 動作序列
   computerUseAssetsDir?: string          // optional — 錨點圖片資料夾
   computerUseFailFast?: boolean          // optional — 遇錯立即中止
-  cvThreshold?: number                   // CV 比對門檻：0.65 / 0.80 / 0.90
+  cvThreshold?: number                   // CV 比對門檻：0.50 寬鬆 / 0.80 標準 / 0.90 嚴格
   cvSearchOnlyNear?: boolean             // true = 只搜錄製座標附近
   cvSearchRadius?: number                // 附近搜尋半徑（px），預設 400
   cvTriggerHover?: boolean               // true = 比對前先觸發 hover 效果（匹配錄製時的 hover 狀態）
@@ -120,7 +120,7 @@ export interface ComputerUseData extends Record<string, unknown> {
   actions: ComputerUseAction[]
   assetsDir: string         // 錨點圖片資料夾（相對工作流）
   failFast: boolean         // 遇錯立即中止
-  cvThreshold: number       // CV 比對門檻：0.65 寬鬆 / 0.80 標準 / 0.90 嚴格
+  cvThreshold: number       // CV 比對門檻：0.50 寬鬆 / 0.80 標準 / 0.90 嚴格
   cvSearchOnlyNear: boolean // true = 只搜錄製座標附近（找不到直接 FAIL）
   cvSearchRadius: number    // 附近搜尋半徑（px），預設 400
   cvTriggerHover: boolean   // true = 比對前先 moveTo 錄製座標觸發 hover
@@ -170,7 +170,7 @@ export function newComputerUseData(index = 0): ComputerUseData {
     actions: [],
     assetsDir: '',
     failFast: true,
-    cvThreshold: 0.65,
+    cvThreshold: 0.5,
     cvSearchOnlyNear: false,
     cvSearchRadius: 400,
     cvTriggerHover: true,
@@ -240,7 +240,7 @@ export function stepsToFlow(steps: StepData[]): { nodes: AppNode[]; edges: Edge[
           actions: s.computerUseActions || [],
           assetsDir: s.computerUseAssetsDir || '',
           failFast: s.computerUseFailFast ?? true,
-          cvThreshold: s.cvThreshold ?? 0.65,
+          cvThreshold: s.cvThreshold ?? 0.5,
           cvSearchOnlyNear: s.cvSearchOnlyNear ?? false,
           cvSearchRadius: s.cvSearchRadius ?? 400,
           cvTriggerHover: s.cvTriggerHover ?? true,
@@ -495,7 +495,7 @@ export function stepsToYaml(name: string, steps: StepData[]): string {
       lines.push(`    computer_use: true`)
       if (s.computerUseAssetsDir) lines.push(`    assets_dir: ${s.computerUseAssetsDir}`)
       if (s.computerUseFailFast === false) lines.push(`    fail_fast: false`)
-      if (s.cvThreshold !== undefined && s.cvThreshold !== 0.65) lines.push(`    cv_threshold: ${s.cvThreshold}`)
+      if (s.cvThreshold !== undefined && s.cvThreshold !== 0.5) lines.push(`    cv_threshold: ${s.cvThreshold}`)
       if (s.cvSearchOnlyNear) lines.push(`    cv_search_only_near: true`)
       if (s.cvSearchRadius !== undefined && s.cvSearchRadius !== 400) lines.push(`    cv_search_radius: ${s.cvSearchRadius}`)
       if (s.cvTriggerHover === false) lines.push(`    cv_trigger_hover: false`)

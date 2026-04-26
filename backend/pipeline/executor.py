@@ -1591,7 +1591,38 @@ async def execute_step_with_skill(
         consecutive_failures = 0
         import time as _time
         skill_start_time = _time.time()
+
+        # ── 檔案變化追蹤（C：iteration 之間的檔案 diff）────────────────────
+        # 每次 run_python 後比對 working_dir 的 mtime 變化，log 哪些檔被新增/改了
+        # 解決：LLM 多輪 rewrite 留下混雜的 PNG/XLSX，下游 validator 看到「不知是哪輪寫的」混亂狀態
+        # 不在這做主動刪除（過於侵入），只 log；step retry 時 runner 已會清 output_path
+        def _snapshot_dir_mtimes(d: str) -> dict:
+            try:
+                p = Path(d)
+                if not p.is_dir():
+                    return {}
+                snap: dict[str, float] = {}
+                # 只看頂層 + 一層子資料夾，避免 .venv 之類超大樹
+                for entry in p.iterdir():
+                    if entry.is_file():
+                        try:
+                            snap[entry.name] = entry.stat().st_mtime
+                        except OSError:
+                            pass
+                return snap
+            except Exception:
+                return {}
+
+        _wd_for_diff = working_dir or (str(Path(output_path).parent) if output_path else "")
+        prev_mtimes = _snapshot_dir_mtimes(_wd_for_diff)
+        if prev_mtimes:
+            logger.info(f"[{step_name}] 📂 工作目錄初始 {len(prev_mtimes)} 個檔（{_wd_for_diff}）")
+
         last_successful_code: Optional[str] = None  # 供 Recipe Book 儲存：只記最後一段成功的 run_python
+        # 防 LLM 在 run_python rc=1 後硬送 done(success=true)：done 來時要先看這個。
+        # 沒跑過 run_python = None（容許純 read_file / web_search 後直接 done）；
+        # 跑過 = True（成功）/ False（失敗，下次 done 拒絕並要 LLM 修錯）
+        last_run_python_ok: Optional[bool] = None
         ask_user_count = 0               # ask_user 呼叫次數（上限 ASK_USER_MAX）
         web_search_count = 0             # web_search 呼叫次數（上限 WEB_SEARCH_MAX_PER_STEP）
         was_interactive = False          # 首次互動標記（給 recipe）
@@ -1633,20 +1664,39 @@ async def execute_step_with_skill(
                 messages.append(HumanMessage(content="請使用工具來執行任務，或呼叫 done 回報結果。"))
                 continue
 
+            # 多工具偵測：LLM 一次塞 run_python + done 是惡習（會把假成功訊息混進 done），
+            # 我們仍然只跑第一個 tool（既有行為），但要明確告訴 LLM「這次只跑 X、忽略 Y」
+            # 用獨立 regex 算 <tool>name</tool> tag 數，比 parser 的多階段 fallback 結果更直接
+            _tag_count = len(re.findall(r"<tool>\s*\w+\s*</tool>", reply))
+            multi_tool_warn = _tag_count > 1
+
             call = tool_calls[0]
             tool_name = call["tool"]
             tool_input = call["input"]
-            logger.info(f"[{step_name}] 解析結果：tool={tool_name}, input_len={len(tool_input)}")
+            logger.info(f"[{step_name}] 解析結果：tool={tool_name}, input_len={len(tool_input)}"
+                        + (f"（⚠ 偵測到 {_tag_count} 個 <tool> 標籤、只跑第一個）" if multi_tool_warn else ""))
 
-            # done → 結束（但先驗證 output 檔案是否存在）
+            # done → 結束（但先驗證 output 檔案是否存在 + 最近 run_python 必須沒失敗）
             if tool_name == "done":
                 try:
                     data = json.loads(tool_input)
                     success = data.get("success", False)
                     summary = data.get("summary", data.get("error", ""))
 
-                    # 如果宣稱成功但 output 檔案不存在，拒絕 done 並要求實際執行
-                    logger.debug(f"[{step_name}] done 檢查：success={success}, output_path={output_path}, exists={Path(output_path).exists() if output_path else 'N/A'}")
+                    # 守門 1：宣稱成功但「最近一次 run_python 失敗」→ 拒絕 done
+                    # 防 LLM 在程式碼炸掉後硬送 done(success=true)、靠殘留檔騙過 output_path 檢查
+                    if success and last_run_python_ok is False:
+                        logger.warning(f"[{step_name}] Agent 在 run_python 失敗後送 done(success=true) — 拒絕並要求修錯")
+                        messages.append(HumanMessage(content=reply))
+                        messages.append(HumanMessage(
+                            content="[系統] 拒絕 done：你最近一次 run_python 執行失敗（看上面的 stderr / Traceback）。"
+                                    "請先用 run_python 修正錯誤、確認真的成功（沒有 [exit code: N] 失敗訊息）後，"
+                                    "才能呼叫 done。不要在程式碼失敗後硬送 success=true。"
+                        ))
+                        continue
+
+                    # 守門 2：宣稱成功但 output 檔案不存在
+                    logger.debug(f"[{step_name}] done 檢查：success={success}, output_path={output_path}, exists={Path(output_path).exists() if output_path else 'N/A'}, last_run_python_ok={last_run_python_ok}")
                     if success and output_path and not Path(output_path).exists():
                         logger.warning(f"[{step_name}] Agent 宣稱成功但輸出檔案 {output_path} 不存在，要求重新執行")
                         messages.append(HumanMessage(content=reply))
@@ -1828,12 +1878,39 @@ async def execute_step_with_skill(
             _tr_preview = tool_result if len(tool_result) <= 3000 else tool_result[:3000] + f"...[已截斷，完整長度 {len(tool_result)} 字]"
             logger.debug(f"[{step_name}] 工具結果：\n{_tr_preview}")
             all_stdout.append(f"[{tool_name}] {tool_result}")
-            # 記錄成功的 run_python 供 Recipe Book 快取
-            if tool_name == "run_python" and "[exit code:" not in tool_result:
-                last_successful_code = tool_input
+            # 追蹤 run_python 成敗：用 [exit code:] 在 tool_result 是否出現當判斷
+            # （sandbox 跟 host 兩條路徑都用同個 marker，見 _skill_run_python / _try_sandbox_exec）
+            if tool_name == "run_python":
+                if "[exit code:" not in tool_result:
+                    last_run_python_ok = True
+                    last_successful_code = tool_input  # 成功才記給 recipe
+                else:
+                    last_run_python_ok = False
+                    logger.info(f"[{step_name}] run_python 失敗 → last_run_python_ok=False（下次 done 會被守門）")
+                # 檔案 diff：log 這次 run_python 改了哪些檔（C 優化）
+                if _wd_for_diff:
+                    cur_mtimes = _snapshot_dir_mtimes(_wd_for_diff)
+                    new_files = [n for n in cur_mtimes if n not in prev_mtimes]
+                    modified = [n for n in cur_mtimes if n in prev_mtimes and cur_mtimes[n] > prev_mtimes[n]]
+                    if new_files or modified:
+                        parts = []
+                        if new_files: parts.append(f"新增 {len(new_files)}: {', '.join(new_files[:8])}")
+                        if modified:  parts.append(f"修改 {len(modified)}: {', '.join(modified[:8])}")
+                        logger.info(f"[{step_name}] 📝 檔案變化 — {' / '.join(parts)}")
+                    prev_mtimes = cur_mtimes
 
             messages.append(HumanMessage(content=reply))
             messages.append(HumanMessage(content=f"[工具結果 — {tool_name}]\n{tool_result}"))
+            # 多工具警告：reply 含 ≥2 個 <tool>，告訴 LLM 我們只跑第一個（{tool_name}），其他 tag 被忽略
+            # 並提醒不要在 <input> 後面接「假的 stdout」當 prediction，那會自我欺騙
+            if multi_tool_warn:
+                messages.append(HumanMessage(
+                    content=f"[系統警告] 你這個 reply 裡有 {_tag_count} 個 <tool> 標籤。系統一次只跑第一個（{tool_name}）"
+                            f"— 其他標籤跟它們的 <input> 都被忽略，包括你可能寫在後面的 done。"
+                            f"\n規則：每個 reply 只能寫一個 <tool>...</tool><input>...</input>，然後等系統回真實結果。"
+                            f"\n禁止在 <input> 之後寫『Successfully executed.』『Recalc Result: ...』這種假裝是執行結果的文字 —"
+                            f"那是你在自我欺騙，真實結果上面已經給你了。"
+                ))
 
             # 迴圈偵測：連續多次只執行短程式碼，注入提示打破迴圈
             if tool_name == "run_python" and len(tool_input) < 200:
@@ -1957,6 +2034,18 @@ async def execute_step_with_skill(
         )
 
     except Exception as e:
+        # 429 / RESOURCE_EXHAUSTED：用獨立 exit code -429 標記，runner 看到後不重試
+        # 避免「skill 撞 quota → 步驟 retry → 再撞 quota → 燒光配額」的連環錯
+        _err_str = str(e)
+        is_quota = ("429" in _err_str or "RESOURCE_EXHAUSTED" in _err_str
+                    or "quota" in _err_str.lower() or "rate limit" in _err_str.lower())
+        if is_quota:
+            logger.error(f"[{step_name}] Skill 執行 LLM 配額/速率受限（429）— 不重試，避免燒光配額：{_err_str[:200]}")
+            return ExecResult(
+                exit_code=-429,
+                stdout="\n".join(all_stdout),
+                stderr=f"LLM provider 配額用盡或速率受限（429）：{_err_str}",
+            )
         logger.error(f"[{step_name}] Skill 執行異常：{e}")
         return ExecResult(
             exit_code=-3,
