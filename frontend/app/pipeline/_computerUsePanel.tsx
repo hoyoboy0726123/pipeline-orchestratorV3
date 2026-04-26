@@ -369,7 +369,7 @@ export default function ComputerUsePanel({ node, pipelineName, onUpdate, onClose
                     : <ChevronDown className="w-3.5 h-3.5 text-gray-400" />}
             <span className="text-xs font-semibold text-gray-500 uppercase tracking-wide flex-1">CV 比對設定</span>
             <span className="text-[11px] text-gray-400 font-mono">
-              {(data.cvThreshold ?? 0.65)}{data.cvSearchOnlyNear ? ' · 只搜附近' : ''}{(data.cvTriggerHover ?? true) ? ` · hover ${data.cvHoverWaitMs ?? 200}ms` : ''}
+              {(data.cvThreshold ?? 0.5)}{data.cvSearchOnlyNear ? ' · 只搜附近' : ''}{(data.cvTriggerHover ?? true) ? ` · hover ${data.cvHoverWaitMs ?? 200}ms` : ''}
             </span>
           </button>
           {cvOpen && (
@@ -380,7 +380,7 @@ export default function ComputerUsePanel({ node, pipelineName, onUpdate, onClose
                 <label className="text-xs text-gray-600 block mb-1.5">比對門檻</label>
                 <div className="grid grid-cols-3 gap-1">
                   {[
-                    { v: 0.65, label: '寬鬆', hint: '容錯高，DPI 差異容忍' },
+                    { v: 0.50, label: '寬鬆', hint: '容錯高，DPI / 主題色 / hover 差異容忍' },
                     { v: 0.80, label: '標準', hint: '預設 sweet spot' },
                     { v: 0.90, label: '嚴格', hint: '幾乎不誤判' },
                   ].map(opt => (
@@ -390,7 +390,7 @@ export default function ComputerUsePanel({ node, pipelineName, onUpdate, onClose
                       onClick={() => onUpdate({ cvThreshold: opt.v })}
                       title={opt.hint}
                       className={`px-2 py-1.5 rounded-lg text-xs font-medium transition-colors border ${
-                        (data.cvThreshold ?? 0.65) === opt.v
+                        (data.cvThreshold ?? 0.5) === opt.v
                           ? 'bg-purple-500 text-white border-purple-500'
                           : 'bg-white text-gray-600 border-gray-200 hover:border-purple-300'
                       }`}

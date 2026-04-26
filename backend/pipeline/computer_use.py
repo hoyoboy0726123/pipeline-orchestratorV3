@@ -90,7 +90,7 @@ class MatchResult:
 
 def find_template(
     template_path: str,
-    threshold: float = 0.85,
+    threshold: float = 0.5,
     multi_scale: bool = True,
     near_xy: Optional[tuple[int, int]] = None,
     search_radius: int = 400,
@@ -261,7 +261,7 @@ def execute_action(
     logger: logging.Logger,
     run_id: Optional[str] = None,
     allow_coord_fallback: bool = True,
-    cv_threshold: float = 0.65,
+    cv_threshold: float = 0.5,
     cv_search_only_near: bool = False,
     cv_search_radius: int = 400,
     cv_trigger_hover: bool = True,
@@ -286,7 +286,7 @@ def execute_action(
             if not img_name:
                 return ActionResult(False, index, atype, "click_image 缺 image 欄位")
             tpl_path = assets_dir / img_name
-            # 門檻：action-level confidence 覆蓋 step 層級 cv_threshold，皆缺就用 0.65
+            # 門檻：action-level confidence 覆蓋 step 層級 cv_threshold，皆缺就用 0.5
             threshold = float(action.get("confidence") or cv_threshold)
             button = action.get("button", "left")
             clicks = int(action.get("clicks", 1))
@@ -540,7 +540,8 @@ def execute_action(
                 return ActionResult(False, index, atype, "wait_image 缺 image 欄位")
             tpl_path = assets_dir / img_name
             timeout = float(action.get("timeout_sec", 10.0))
-            threshold = float(action.get("confidence", 0.85))
+            # action.confidence 沒設或為 0 → 退步驟層級 cv_threshold（跟 click_image 一致）
+            threshold = float(action.get("confidence") or cv_threshold)
             deadline = time.time() + timeout
             last_conf = 0.0
             while time.time() < deadline:
@@ -743,7 +744,7 @@ def execute_computer_use_step(
     logger: logging.Logger,
     run_id: Optional[str] = None,
     fail_fast: bool = True,
-    cv_threshold: float = 0.65,
+    cv_threshold: float = 0.5,
     cv_search_only_near: bool = False,
     cv_search_radius: int = 400,
     cv_trigger_hover: bool = True,
@@ -757,7 +758,7 @@ def execute_computer_use_step(
     - actions: ComputerUseAction 物件的 list of dict
     - assets_dir: 錨點圖片資料夾（絕對路徑，通常是 ai_output/<name>/ 下的子資料夾）
     - fail_fast: True 則遇到失敗立刻中止；False 則繼續但記錄失敗數
-    - cv_threshold: CV 比對門檻（0.65 寬鬆 / 0.80 標準 / 0.90 嚴格）
+    - cv_threshold: CV 比對門檻（0.50 寬鬆 / 0.80 標準 / 0.90 嚴格）
     - cv_search_only_near: True = 只搜錄製座標附近、找不到直接 FAIL（不退回全螢幕也不退回座標）
     - cv_search_radius: 附近搜尋半徑（像素）；實際搜尋範圍 (2r × 2r)
     - cv_trigger_hover: True = 比對前先 moveTo(錄製座標) + 200ms 讓 Windows hover 效果出現

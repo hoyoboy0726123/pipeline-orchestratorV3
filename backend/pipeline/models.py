@@ -70,7 +70,8 @@ class ComputerUseAction(BaseModel):
     seconds: float = 0.0
     timeout_sec: float = 10.0  # wait_image 的最大等待秒數
     dy: int = 0                # scroll 動作：滾輪缺口數（正數上、負數下）
-    confidence: float = 0.65   # 圖像比對相似度門檻 (0.0-1.0)；實測錄製情境 0.65 最平衡
+    confidence: float = 0.5    # 圖像比對相似度門檻 (0.0-1.0)；跟步驟層級 cv_threshold 寬鬆 tier 一致
+                               # 實測錄製情境 0.5 對 DPI / 主題色 / hover 差異容忍度好，誤判仍可接受
     button: str = "left"       # click 按鈕：left/right/middle
     clicks: int = 1            # click 次數：1=單擊, 2=雙擊
     description: str = ""      # 使用者可讀的動作描述（給 UI 顯示）
@@ -120,7 +121,7 @@ class PipelineStep(BaseModel):
     assets_dir: str = ""         # 錨點圖片資料夾（相對路徑掛到工作流目錄下）
     fail_fast: bool = True       # True = 任一動作失敗立即中止；False = 警告後繼續
     # ── CV 比對設定（套用到本節點所有 click_image/drag 動作）──────────
-    cv_threshold: float = 0.65   # 比對門檻：0.65 寬鬆 / 0.80 標準 / 0.90 嚴格
+    cv_threshold: float = 0.5    # 比對門檻：0.50 寬鬆 / 0.80 標準 / 0.90 嚴格
     cv_search_only_near: bool = False  # True = 只在錄製座標附近搜尋，不擴大到全螢幕
     cv_search_radius: int = 400  # 附近搜尋半徑（像素）；實際搜尋範圍為 (2r × 2r)
     cv_trigger_hover: bool = True  # True = 比對前先把游標移到錄製座標並等，讓 Windows hover 效果出現
