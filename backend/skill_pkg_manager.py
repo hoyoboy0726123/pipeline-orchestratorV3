@@ -3,12 +3,13 @@ Skill 套件管理器 — 管理 AI技能節點可用的 Python 第三方套件
 
 V3 支援雙環境：
 - host       ：backend 所在 Windows venv（對應 skill_packages.txt）
-- sandbox    ：WSL Docker 容器 pipeline-sandbox（對應 sandbox/requirements.txt）
+- sandbox    ：WSL Docker 容器 pipeline-sandbox-v4（對應 sandbox/requirements.txt）
 
 UI 一次只操作一邊，跟著 skill_sandbox_mode toggle 走。target 參數決定目標：
   "auto" → 讀 settings.skill_sandbox_mode 決定（預設）
   "host" / "sandbox" → 明確指定
 """
+import re
 import subprocess
 import sys
 import time
@@ -16,10 +17,55 @@ import json as _json
 from pathlib import Path
 from threading import Lock
 
+
+# ── 套件名 PEP 503 正規化 — 整個模組唯一的「相同套件」比對基準 ────────────
+# 規則：
+#   - 全部小寫
+#   - extras（[xxx]）與版本約束（==、>=、<=）剝掉
+#   - 連續的 _ / - / . 都規約成單一 -
+# 例：fake_useragent / Fake-UserAgent / fake-useragent 都規約成 fake-useragent，
+#     lxml_html_clean / lxml-html-clean 也視為同一個。
+# 任何「比較兩個套件名是否相同」的地方都要走這個函式 — 直接用 .lower() 不夠
+# （pip list 輸出常用底線、requirements 常用 dash、user 隨便寫），會誤判「未安裝」。
+_NORM_RE = re.compile(r"[-_.]+")
+
+
+def normalize_pkg_name(pkg: str) -> str:
+    """PEP 503 正規化套件名（去 extras/版本、底線→dash、小寫）。"""
+    base = pkg.split("[")[0].split("=")[0].split(">")[0].split("<")[0].split("~")[0].split("!")[0].strip().lower()
+    return _NORM_RE.sub("-", base)
+
+
+# 舊名 alias（先前 caller 都叫 _base_name，保留向後相容）
+def _base_name(pkg: str) -> str:
+    return normalize_pkg_name(pkg)
+
+
 _PKG_FILE = Path(__file__).parent / "skill_packages.txt"
 # 沙盒的套件清單（對應容器內環境）— 跟 Dockerfile 一起被 sandbox/setup.sh 讀取
 _SANDBOX_REQ_FILE = Path(__file__).parent.parent / "sandbox" / "requirements.txt"
-_SANDBOX_CONTAINER = "pipeline-sandbox"
+# 從 sandbox 模組共用容器名、避免兩邊寫死不一致（之前 V4 backport 漏改、留 "v4" 跑 v5 → 套件全顯示「未安裝」）
+try:
+    from pipeline.sandbox import CONTAINER_NAME as _SANDBOX_CONTAINER
+except Exception:
+    _SANDBOX_CONTAINER = "pipeline-sandbox"
+
+
+# ── Host-only 套件（裝沙盒容器會失敗，因為它們是 Windows-only） ────────
+# 這些套件 sandbox（Linux 容器）連 pip install 都不會成功，直接在 add_package_sandbox
+# 攔截並回友善訊息。Outlook 自動化節點需要這些，但只跑 host，所以 sandbox 不需要。
+HOST_ONLY_PACKAGES: frozenset[str] = frozenset({
+    "pywin32",        # win32com / win32api / pythoncom 等的母套件
+    "pywin32-ctypes", # 偶爾被當依賴拉進來
+    "pywinauto",      # UI Automation
+    "comtypes",       # 補位 COM interface
+    # 注意：python-docx / python-pptx / pandas / openpyxl 不在這 — 它們跨平台
+})
+
+
+def is_host_only(pkg_name: str) -> bool:
+    """套件是否只能裝 host venv（裝 sandbox 會失敗）。"""
+    return normalize_pkg_name(pkg_name) in HOST_ONLY_PACKAGES
 
 
 def _resolve_target(target: str) -> str:
@@ -54,9 +100,10 @@ def _pip_snapshot(force_refresh: bool = False) -> dict[str, dict]:
             )
             if r.returncode == 0:
                 for item in _json.loads(r.stdout or "[]"):
-                    name = str(item.get("name") or "").lower()
+                    name = str(item.get("name") or "")
                     if name:
-                        snapshot[name] = {"version": str(item.get("version") or "")}
+                        # 走唯一的正規化函式 — 跟所有 caller 一致
+                        snapshot[normalize_pkg_name(name)] = {"version": str(item.get("version") or "")}
         except Exception:
             pass
         _PIP_CACHE["ts"] = time.time()
@@ -91,8 +138,7 @@ def _write_packages(packages: list[str]) -> None:
 
 def _is_installed(pkg_name: str) -> bool:
     """檢查套件是否已安裝（走快照，不呼叫 subprocess）"""
-    base = pkg_name.split("[")[0].split("=")[0].split(">")[0].split("<")[0].strip().lower()
-    return base in _pip_snapshot()
+    return normalize_pkg_name(pkg_name) in _pip_snapshot()
 
 
 def _pip_install(pkg_name: str) -> tuple[bool, str]:
@@ -113,7 +159,7 @@ def _pip_install(pkg_name: str) -> tuple[bool, str]:
 
 def _pip_uninstall(pkg_name: str) -> tuple[bool, str]:
     """移除單一套件"""
-    base = pkg_name.split("[")[0].split("=")[0].split(">")[0].split("<")[0].strip()
+    base = normalize_pkg_name(pkg_name)
     try:
         result = subprocess.run(
             [sys.executable, "-m", "pip", "uninstall", base, "-y", "-q"],
@@ -147,8 +193,7 @@ def list_packages() -> list[dict]:
     snapshot = _pip_snapshot()
     result = []
     for pkg in packages:
-        base = pkg.split("[")[0].split("=")[0].split(">")[0].split("<")[0].strip().lower()
-        info = snapshot.get(base)
+        info = snapshot.get(normalize_pkg_name(pkg))
         installed = info is not None
         version = info.get("version", "") if info else ""
         result.append({
@@ -160,28 +205,40 @@ def list_packages() -> list[dict]:
 
 
 def add_package(pkg_name: str) -> tuple[bool, str]:
-    """新增套件：安裝 + 寫入清單"""
+    """新增套件：實際安裝 + 寫入清單。
+    流程順序很重要：
+      1. 先檢查容器/venv 內實際是否安裝 — 已裝就直接回成功（聲明 ≠ 已安裝）
+      2. 沒裝就跑 pip install
+      3. 安裝成功後若沒在清單也加入清單
+    之前的版本只檢查「是否在清單聲明中」、user 手動編輯了 requirements.txt
+    但容器還沒裝、按 [安裝] 按鈕會被誤拒「已在清單中」。
+    """
     pkg_name = pkg_name.strip()
     if not pkg_name:
         return False, "套件名稱不能為空"
 
     packages = _read_packages()
-    base = pkg_name.split("[")[0].split("=")[0].split(">")[0].split("<")[0].strip().lower()
+    base = _base_name(pkg_name)
+    in_list = any(_base_name(p) == base for p in packages)
 
-    # 檢查是否已在清單中
-    for p in packages:
-        existing_base = p.split("[")[0].split("=")[0].split(">")[0].split("<")[0].strip().lower()
-        if existing_base == base:
-            return False, f"{pkg_name} 已在清單中"
+    # 1. 已實際安裝（不論清單）→ 直接成功
+    snapshot = _pip_snapshot()
+    if base in snapshot:
+        # 順手補登清單（聲明跟實際同步）
+        if not in_list:
+            packages.append(pkg_name)
+            _write_packages(packages)
+        return True, f"✅ {pkg_name} 已安裝（{snapshot[base].get('version', '')}）"
 
-    # 先安裝
+    # 2. 沒安裝 → 跑 pip install
     ok, msg = _pip_install(pkg_name)
     if not ok:
         return False, msg
 
-    # 寫入清單 + 讓快取失效
-    packages.append(pkg_name)
-    _write_packages(packages)
+    # 3. 安裝成功 + 補登清單
+    if not in_list:
+        packages.append(pkg_name)
+        _write_packages(packages)
     _invalidate_pip_cache()
     return True, msg
 
@@ -190,14 +247,13 @@ def remove_package(pkg_name: str) -> tuple[bool, str]:
     """移除套件：從清單移除 + 解除安裝"""
     pkg_name = pkg_name.strip()
     packages = _read_packages()
-    base = pkg_name.split("[")[0].split("=")[0].split(">")[0].split("<")[0].strip().lower()
+    base = normalize_pkg_name(pkg_name)
 
     # 從清單中移除
     new_packages = []
     found = False
     for p in packages:
-        existing_base = p.split("[")[0].split("=")[0].split(">")[0].split("<")[0].strip().lower()
-        if existing_base == base:
+        if normalize_pkg_name(p) == base:
             found = True
         else:
             new_packages.append(p)
@@ -215,11 +271,6 @@ def remove_package(pkg_name: str) -> tuple[bool, str]:
 
 
 # ── venv 同步：找出已裝但不在清單中的套件 ────────────────────────────────────
-def _base_name(pkg: str) -> str:
-    """取得套件基礎名（去除 extras 與版本號）"""
-    return pkg.split("[")[0].split("=")[0].split(">")[0].split("<")[0].strip().lower()
-
-
 _BOOTSTRAP_EXCLUDES = {"pip", "setuptools", "wheel"}
 
 
@@ -260,7 +311,7 @@ def scan_unlisted_packages() -> list[dict]:
         name = pkg.get("name", "")
         if not name:
             continue
-        base = name.lower()
+        base = normalize_pkg_name(name)
         if base in _BOOTSTRAP_EXCLUDES:
             continue
         if base in skill_bases:
@@ -268,7 +319,7 @@ def scan_unlisted_packages() -> list[dict]:
         if base in req_bases:
             continue
         unlisted.append({"name": name, "version": pkg.get("version", "")})
-    unlisted.sort(key=lambda x: x["name"].lower())
+    unlisted.sort(key=lambda x: normalize_pkg_name(x["name"]))
     return unlisted
 
 
@@ -301,9 +352,10 @@ def _sandbox_pip_snapshot(force_refresh: bool = False) -> dict[str, dict]:
             )
             if r.returncode == 0:
                 for item in _json.loads(r.stdout or "[]"):
-                    name = str(item.get("name") or "").lower()
+                    name = str(item.get("name") or "")
                     if name:
-                        snapshot[name] = {"version": str(item.get("version") or "")}
+                        # 走唯一的正規化函式 — 跟 _base_name / list_packages_sandbox 一致
+                        snapshot[normalize_pkg_name(name)] = {"version": str(item.get("version") or "")}
         except Exception:
             pass
         _SANDBOX_PIP_CACHE["ts"] = time.time()
@@ -362,7 +414,7 @@ def _write_sandbox_packages(packages: list[str]) -> None:
         "# 分成幾個 tier：build 時 Dockerfile 會拆成多個 RUN 讓每層獨立裝，避免一次性 OOM\n"
         "#\n"
         "# 沒進這清單但某個 workflow 需要的套件，可以事後臨時裝進容器：\n"
-        "#   wsl sudo docker exec pipeline-sandbox pip install <pkg>\n"
+        "#   wsl sudo docker exec pipeline-sandbox-v4 pip install <pkg>\n"
         "# 要永久加，把它寫進這檔然後 rebuild image。\n\n"
     )
     _SANDBOX_REQ_FILE.write_text(header + "\n".join(packages) + "\n", encoding="utf-8")
@@ -403,20 +455,41 @@ def list_packages_sandbox() -> list[dict]:
 
 
 def add_package_sandbox(pkg_name: str) -> tuple[bool, str]:
-    """沙盒安裝套件 + 寫進 sandbox/requirements.txt（rebuild 後也保留）。"""
+    """沙盒安裝套件 + 寫進 sandbox/requirements.txt（rebuild 後也保留）。
+    跟 host 版同樣的順序：先檢查容器內實際是否裝、沒裝才跑 pip、最後補登 requirements.txt。
+    之前直接檢查「在 requirements.txt 聲明過」就拒絕、會讓 user 手動編輯 txt 但容器
+    還沒裝時、按[安裝]按鈕被誤拒「已在沙盒清單中」。
+    """
     pkg_name = pkg_name.strip()
     if not pkg_name:
         return False, "套件名稱不能為空"
+    # Host-only 套件（pywin32 等）裝 Linux 容器會失敗 — 提早攔下、給清楚訊息
+    if is_host_only(pkg_name):
+        return False, (f"❌ {pkg_name} 是 Windows-only 套件，無法裝到 Linux 沙盒容器。"
+                       f"請切換到 host 模式（Settings → 沙盒模式 → host）後再裝；"
+                       f"或這個套件本來就是給 Outlook 自動化節點用，sandbox 用不到。")
+
     declared = _read_sandbox_packages()
     base = _base_name(pkg_name)
-    for p in declared:
-        if _base_name(p) == base:
-            return False, f"{pkg_name} 已在沙盒清單中"
+    in_list = any(_base_name(p) == base for p in declared)
+
+    # 1. 已實際安裝在容器內 → 直接成功
+    snapshot = _sandbox_pip_snapshot()
+    if base in snapshot:
+        if not in_list:
+            declared.append(pkg_name)
+            _write_sandbox_packages(declared)
+        return True, f"✅ {pkg_name} 已安裝在沙盒容器（{snapshot[base].get('version', '')}）"
+
+    # 2. 沒裝 → 跑 pip install
     ok, msg = _sandbox_pip_install(pkg_name)
     if not ok:
         return False, msg
-    declared.append(pkg_name)
-    _write_sandbox_packages(declared)
+
+    # 3. 安裝成功後補登 requirements.txt
+    if not in_list:
+        declared.append(pkg_name)
+        _write_sandbox_packages(declared)
     _invalidate_sandbox_pip_cache()
     return True, msg
 
